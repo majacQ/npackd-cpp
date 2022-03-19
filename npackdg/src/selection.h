@@ -1,0 +1,35 @@
+#ifndef SELECTION_H
+#define SELECTION_H
+
+#include <vector>
+
+#include "QString"
+
+/**
+ * QWidgets may implement this interface to provide context to actions.
+ */
+class Selection
+{
+public:
+    explicit Selection();
+
+    /**
+     * @param type type of the requested objects. Example: "Package"
+     * @return list of selected objects
+     */
+    virtual std::vector<void*> getSelected(const QString& type) const = 0;
+
+    /**
+     * @return current selected QWidget* or 0
+     */
+    static Selection* findCurrent();
+
+    /**
+     * This signal will be emitted each time the selection changes.
+     */
+    // void selectionChanged();
+
+    virtual ~Selection();
+};
+
+#endif // SELECTION_H

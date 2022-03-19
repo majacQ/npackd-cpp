@@ -3,15 +3,14 @@
 
 #include <time.h>
 
+#include <QJsonObject>
 #include <QtCore/QCoreApplication>
-#include <qdebug.h>
-#include <qstringlist.h>
-#include <qstring.h>
 
 #include "repository.h"
 #include "commandline.h"
 #include "job.h"
 #include "clprogress.h"
+#include "dbrepository.h"
 
 /**
  * NpackdCL
@@ -23,38 +22,56 @@ private:
     CommandLine cl;
     CLProgress clp;
 
+    bool debug;
+    bool interactive;
+
+    static void printJSON(const QJsonObject & obj);
+
     /**
      * @brief defines the NPACKD_CL variable and adds the NpackdCL package to
      *     the local repository
+     *
+     * @param r DB repository
      * @return error message
      */
-    QString addNpackdCL();
+    QString addNpackdCL(DBRepository *r);
 
-    void usage();
-    QString path();
-    QString add();
-    QString remove();
-    QString addRepo();
-    QString removeRepo();
-    QString search();
-    QString list();
-    QString info();
-    QString update();
-    QString detect();
-    QString listRepos();
-    QString which();
-    QString check();
-    QString getInstallPath();
-    QString setInstallPath();
+    void usage(Job *job);
+    void path(Job* job);
+    void place(Job *job);
+    void add(Job *job);
+    void remove(Job *job);
+    void addRepo(Job *job);
+    void setRepo(Job *job);
+    void removeRepo(Job *job);
+    void search(Job *job);
+    void list(Job *job);
+    void info(Job *job);
+    void update(Job *job);
+    void detect(Job *job);
+    void listRepos(Job *job);
+    void which(Job *job);
+    void where(Job *job);
+    void check(Job *job);
+    void getInstallPath(Job *job);
+    void setInstallPath(Job *job);
+    void removeSCP(Job *job);
+    void build(Job *job);
 
-    bool confirm(const QList<InstallOperation *> ops, QString *title,
+    bool confirm(const std::vector<InstallOperation *> ops, QString *title,
             QString *err);
     QString printDependencies(bool onlyInstalled,
             const QString parentPrefix, int level, PackageVersion *pv);
-    void processInstallOperations(Job *job,
-            const QList<InstallOperation *> &ops, DWORD programCloseType);
-    QStringList  sortPackageVersionsByPackageTitle(
-            QList<PackageVersion *> *list);
+    void processInstallOperations(Job *job, DBRepository *rep,
+            const std::vector<InstallOperation *> &ops,
+            const DAG &opsDependencies, DWORD programCloseType,
+            bool interactive, const QString user, const QString password,
+            const QString proxyUser, const QString proxyPassword);
+    std::vector<QString> sortPackageVersionsByPackageTitle(
+            std::vector<PackageVersion *> *list);
+public:
+    App();
+    Job* currentJob;
 public slots:
     /**
      * Process the command line.

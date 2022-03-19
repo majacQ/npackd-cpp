@@ -6,7 +6,6 @@
 #include <QtTest/QtTest>
 #include <QtCore/QCoreApplication>
 #include <qdebug.h>
-#include <qstringlist.h>
 #include <qstring.h>
 
 #include "repository.h"
@@ -27,9 +26,29 @@ private slots:
     void test();
 
     /**
-     * Tests für CommandLine
+     * Tests for InstalledPackages
+     */
+    void testInstalledPackages();
+
+    /**
+     * Tests for CommandLine
      */
     void testCommandLine();
+
+    /**
+     * Tests for WPMUtils::copyDirectory
+     */
+    void testCopyDirectory();
+
+    /**
+     * Tests for WPMUtils::normalizePath
+     */
+    void testNormalizePath();
+
+    /**
+     * @brief tests topological search in a DAG
+     */
+    void testTopologicalSort();
 };
 
 #endif // APP_H

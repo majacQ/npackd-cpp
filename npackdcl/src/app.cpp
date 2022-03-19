@@ -1,10 +1,10 @@
 #include <limits>
-#include <math.h>
+#include <cmath>
 
-#include <QRegExp>
-#include <QScopedPointer>
-#include <QProcess>
-#include <QMultiMap>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QTextStream>
 
 #include "app.h"
 #include "wpmutils.h"
@@ -15,6 +15,8 @@
 #include "abstractrepository.h"
 #include "dbrepository.h"
 #include "hrtimer.h"
+#include "controlpanelthirdpartypm.h"
+#include "packageutils.h"
 
 static bool compareByPackageTitle(const QPair<PackageVersion*, QString>& e1,
         const QPair<PackageVersion*, QString>& e2) {
@@ -35,26 +37,30 @@ bool packageLessThan(const Package* p1, const Package* p2)
     return p1->title.toLower() < p2->title.toLower();
 }
 
-QStringList App::sortPackageVersionsByPackageTitle(
-        QList<PackageVersion*> *list) {
-    QList<QPair<PackageVersion*, QString> > items;
+App::App() : currentJob(nullptr)
+{
 
-    for (int i = 0; i < list->count(); i++) {
-        PackageVersion* pv = list->at(i);
+}
+
+std::vector<QString> App::sortPackageVersionsByPackageTitle(
+        std::vector<PackageVersion*> *list) {
+    std::vector<QPair<PackageVersion*, QString> > items;
+
+    for (auto pv: *list) {
         QString s = pv->getPackageTitle();
 
         QPair<PackageVersion*, QString> pair;
         pair.first = pv;
         pair.second = s;
-        items.append(pair);
+        items.push_back(pair);
     }
 
-    qSort(items.begin(), items.end(), compareByPackageTitle);
+    std::sort(items.begin(), items.end(), compareByPackageTitle);
 
-    QStringList titles;
-    for (int i = 0; i < list->count(); i++) {
+    std::vector<QString> titles;
+    for (int i = 0; i < static_cast<int>(list->size()); i++) {
         (*list)[i] = items.at(i).first;
-        titles.append(items.at(i).second);
+        titles.push_back(items.at(i).second);
     }
 
     return titles;
@@ -62,120 +68,202 @@ QStringList App::sortPackageVersionsByPackageTitle(
 
 int App::process()
 {
+    // alphabetically sorted options by the short name
+    cl.add("bare-format", 'b', "bare format (no heading or summary)",
+            "", false, "list,list-repos,search,install-dir,which,where,info,path");
+    cl.add("cmd", 'c', "output a .cmd script",
+            "", false, "path");
+    cl.add("debug", 'd', "turn on the debug output", "", false);
+    cl.add("end-process", 'e',
+            "list of ways to close running applications \r\n(c=close, k=kill, s=disconnect from file shares, d=stop services, t=send Ctrl+C). The default value is 'c'.",
+            "[c][k][s][t]", false, "remove,rm,update");
+    cl.add("file", 'f', "file or directory", "file", false,
+            "add,place,set-install-dir,update,where,which,path");
+    cl.add("install", 'i',
+            "install a package if it was not installed", "", false, "update");
+    cl.add("json", 'j', "json format for the output",
+            "", false, "list,list-repos,search,install-dir,which,where,info,path");
+    cl.add("keep-directories", 'k',
+            "use the same directories for updated packages", "", false,
+           "update");
+    cl.add("local", 'l',
+            "install packages for the current user instead of system-wide",
+            "", false);
+    cl.add("non-interactive", 'n',
+            "assume that there is no user and do not ask for input", "", false);
     cl.add("package", 'p',
             "internal package name (e.g. com.example.Editor or just Editor)",
-            "package", true);
-    cl.add("versions", 'r', "versions range (e.g. [1.5,2))",
-            "range", false);
-    cl.add("version", 'v', "version number (e.g. 1.5.12)",
-            "version", false);
-    cl.add("url", 'u', "repository URL (e.g. https://www.example.com/Rep.xml)",
-            "repository", false);
-    cl.add("status", 's', "filters package versions by status",
-            "status", false);
-    cl.add("bare-format", 'b', "bare format (no heading or summary)",
-            "", false);
+            "package", true, "add,info,path,place,remove,update,rm,build");
     cl.add("query", 'q', "search terms (e.g. editor)",
-            "search terms", false);
-    cl.add("debug", 'd', "turn on the debug output", "", false);
-    cl.add("file", 'f', "file or directory", "file", false);
-    cl.add("end-process", 'e',
-        "list of ways to close running applications (c=close, k=kill). The default value is 'c'.",
-        "[c][k]", false);
+            "search terms", false, "search,update");
+    cl.add("versions", 'r', "versions range (e.g. [1.5,2))",
+            "range", true, "add,path,update");
+
+    // --status for the command "list" is supported for compatibility reasons
+    cl.add("status", 's', "filters packages by status",
+            "status", false, "list,search");
+
+    cl.add("timeout", 't', "timeout in seconds",
+            "seconds", false, "remove,rm,update,add");
+    cl.add("url", 'u', "repository URL (e.g. https://www.example.com/Rep.xml)",
+            "repository", false, "add-repo,remove-repo,set-repo,add,update,search");
+    cl.add("version", 'v', "version number (e.g. 1.5.12)",
+            "version", false, "add,info,path,place,rm,remove");
+
+    cl.add("user", 0, "user name for the HTTP authentication",
+            "user name", false, "add,update,detect,search");
+    cl.add("password", 0, "password for the HTTP authentication",
+            "password", false, "add,update,detect,search");
+
+    cl.add("proxy-user", 0, "user name for the HTTP proxy authentication",
+            "user name", false, "add,update,detect,search");
+    cl.add("proxy-password", 0, "password for the HTTP proxy authentication",
+            "password", false, "add,update,detect,search");
+
+    cl.add("title", 0, "package title or a regular expression in JavaScript syntax. Example: /PDF/i",
+            "title", false, "remove-scp");
+
+    cl.add("output-package", 0,
+            "internal package name (e.g. com.example.Editor or just Editor)",
+            "package", true, "build");
 
     QString err = cl.parse();
     if (!err.isEmpty()) {
-        WPMUtils::outputTextConsole("Error: " + err + "\n", false);
-        return 1;
+        err = "Error: " + err;
     }
+
     // cl.dump();
 
-    if (cl.isPresent("debug")) {
-        clp.setUpdateRate(0);
+    if (err.isEmpty()) {
+        this->interactive = !cl.isPresent("non-interactive");
+
+        this->debug = cl.isPresent("debug");
+
+        if (cl.isPresent("local"))
+            PackageUtils::globalMode = false;
+
+        if (debug) {
+            clp.setUpdateRate(0);
+
+            QLoggingCategory::setFilterRules("npackd=true");
+        }
     }
 
-    QStringList fr = cl.getFreeArguments();
+    std::vector<CommandLine::ParsedOption*> options = cl.getParsedOptions();
+
+    QString cmd;
+    if (options.size() > 0 && options.at(0)->opt == nullptr) {
+        cmd = options.at(0)->value;
+    }
+
+    if (!err.isEmpty()) {
+        // nothing. The error will be processed later.
+    } else if (options.size() == 0) {
+        Job* job = new Job();
+        usage(job);
+        delete job;
+    } else if (cmd.isEmpty()) {
+        err = QStringLiteral("Missing command");
+    } else {
+        std::vector<CommandLine::ParsedOption*> parsed = cl.getParsedOptions();
+        for (auto p: parsed) {
+            CommandLine::Option* opt = p->opt;
+            if (opt && opt->allowedCommands.size() > 0) {
+                // qCDebug(npackd) << "1" << opt->allowedCommands.count();
+                if (std::find(opt->allowedCommands.begin(), opt->allowedCommands.end(), cmd) == opt->allowedCommands.end()) {
+                    err = "The option --" + opt->name +
+                            " is not allowed for the command \"" + cmd + "\". Allowed commands: " +
+                            WPMUtils::join(opt->allowedCommands, ",");
+                    break;
+                }
+            }
+        }
+
+        Job* job;
+        if (cl.isPresent("bare-format") || cl.isPresent("json") ||
+                cmd == "help" || cmd == "path")
+            job = new Job();
+        else
+            job = clp.createJob();
+
+        this->currentJob = job;
+
+        QString timeout = cl.get("timeout");
+        if (!timeout.isNull()) {
+            bool ok;
+            int timeout_ = timeout.toInt(&ok);
+            if (ok) {
+                if (timeout_ > 0)
+                    job->setTimeout(timeout_);
+                else
+                    err = "The value for --timeout should be positive";
+            } else {
+                err = "The value for --timeout is not a valid number";
+            }
+        }
+
+        if (!err.isEmpty()) {
+            job->setErrorMessage(err);
+        } else if (cmd == "help") {
+            usage(job);
+        } else if (cmd == "path") {
+            path(job);
+        } else if (cmd == "place") {
+            place(job);
+        } else if (cmd == "remove" || cmd == "rm") {
+            remove(job);
+        } else if (cmd == "add") {
+            add(job);
+        } else if (cmd == "add-repo") {
+            addRepo(job);
+        } else if (cmd == "set-repo") {
+            setRepo(job);
+        } else if (cmd == "remove-repo") {
+            removeRepo(job);
+        } else if (cmd == "remove-scp") {
+            removeSCP(job);
+        } else if (cmd == "list-repos") {
+            listRepos(job);
+        } else if (cmd == "search") {
+            search(job);
+        } else if (cmd == "check") {
+            check(job);
+        } else if (cmd == "which") {
+            which(job);
+        } else if (cmd == "where") {
+            where(job);
+        } else if (cmd == "list") {
+            list(job);
+        } else if (cmd == "info") {
+            info(job);
+        } else if (cmd == "update") {
+            update(job);
+        } else if (cmd == "detect") {
+            detect(job);
+        } else if (cmd == "set-install-dir") {
+            setInstallPath(job);
+        } else if (cmd == "install-dir") {
+            getInstallPath(job);
+        } else if (cmd == "build") {
+            build(job);
+        } else {
+            job->setErrorMessage(QStringLiteral("Wrong command: ") + cmd +
+                    QStringLiteral(". Try \"ncl help\""));
+        }
+
+        err = job->getErrorMessage();
+
+        this->currentJob = nullptr;
+
+        delete job;
+    }
 
     int r = 0;
-    if (fr.count() == 0) {
-        WPMUtils::outputTextConsole("Missing command. Try npackdcl help\n",
-                false);
+    if (err.isEmpty())
+        r = 0;
+    else {
         r = 1;
-    } else if (fr.count() > 1) {
-        WPMUtils::outputTextConsole("Unexpected argument: " +
-                fr.at(1) + "\n", false);
-        r = 1;
-    } else {
-        const QString cmd = fr.at(0);
-
-        if (cmd == "help") {
-            usage();
-        } else if (cmd == "path") {
-            err = path();
-        } else if (cmd == "remove" || cmd == "rm") {
-            err = DBRepository::getDefault()->openDefault();
-            if (err.isEmpty()) {
-                /* we ignore the returned error as it should also work for non-admins */
-                addNpackdCL();
-
-                err = remove();
-            }
-        } else if (cmd == "add") {
-            err = DBRepository::getDefault()->openDefault();
-            if (err.isEmpty()) {
-                /* we ignore the returned error as it should also work for non-admins */
-                addNpackdCL();
-
-                err = add();
-            }
-        } else if (cmd == "add-repo") {
-            err = addRepo();
-        } else if (cmd == "remove-repo") {
-            err = removeRepo();
-        } else if (cmd == "list-repos") {
-            err = listRepos();
-        } else if (cmd == "search") {
-            err = DBRepository::getDefault()->openDefault("default", true);
-            if (err.isEmpty())
-                err = search();
-        } else if (cmd == "check") {
-            err = DBRepository::getDefault()->openDefault();
-            if (err.isEmpty())
-                err = check();
-        } else if (cmd == "which") {
-            err = DBRepository::getDefault()->openDefault("default", true);
-            if (err.isEmpty())
-                err = which();
-        } else if (cmd == "list") {
-            err = DBRepository::getDefault()->openDefault("default", true);
-            if (err.isEmpty())
-                err = list();
-        } else if (cmd == "info") {
-            err = DBRepository::getDefault()->openDefault("default", true);
-            if (err.isEmpty())
-                err = info();
-        } else if (cmd == "update") {
-            err = DBRepository::getDefault()->openDefault();
-            if (err.isEmpty())
-                err = update();
-        } else if (cmd == "detect") {
-            err = DBRepository::getDefault()->openDefault();
-            if (err.isEmpty())
-                err = detect();
-        } else if (cmd == "set-install-dir") {
-            err = setInstallPath();
-        } else if (cmd == "install-dir") {
-            err = getInstallPath();
-        } else {
-            err = "Wrong command: " + cmd + ". Try npackdcl help";
-        }
-
-        if (err.isEmpty())
-            r = 0;
-        else {
-            r = 1;
-            WPMUtils::outputTextConsole(err + "\n", false);
-        }
+        qCCritical(npackd).noquote() << err;
     }
 
     QCoreApplication::instance()->exit(r);
@@ -183,195 +271,365 @@ int App::process()
     return r;
 }
 
-QString App::addNpackdCL()
+void App::printJSON(const QJsonObject &obj)
+{
+    // WPMUtils::writeln does not work for very long texts
+
+    QJsonDocument d(obj);
+
+    std::vector<QString> sl = WPMUtils::split(QString::fromUtf8(d.toJson(
+            QJsonDocument::Indented)), "\n");
+    for (int i = 0; i < static_cast<int>(sl.size()); i++) {
+        if (i != static_cast<int>(sl.size()) - 1)
+            WPMUtils::writeln(sl.at(i));
+        else
+            WPMUtils::outputTextConsole(sl.at(i));
+    }
+}
+
+QString App::addNpackdCL(DBRepository* r)
 {
     QString err;
 
-    AbstractRepository* r = AbstractRepository::getDefault_();
+    Version myVersion;
+    (void) myVersion.setVersion(NPACKD_VERSION);
     PackageVersion* pv = r->findPackageVersion_(
             "com.googlecode.windows-package-manager.NpackdCL",
-            Version(NPACKD_VERSION), &err);
+            myVersion, &err);
     if (!pv) {
         pv = new PackageVersion(
                 "com.googlecode.windows-package-manager.NpackdCL");
-        pv->version = Version(NPACKD_VERSION);
-        r->savePackageVersion(pv);
+        pv->version = myVersion;
+        r->savePackageVersion(pv, true);
     }
     delete pv;
-    pv = 0;
+    pv = nullptr;
 
-    err = r->updateNpackdCLEnvVar();
+    err = InstalledPackages::getDefault()->updateNpackdCLEnvVar();
 
     return err;
 }
 
-void App::usage()
+void App::usage(Job* job)
 {
-    WPMUtils::outputTextConsole(QString(
-            "NpackdCL %1 - Npackd command line tool\n").
-            arg(NPACKD_VERSION));
+    Version my;
+    my.setVersion(NPACKD_VERSION);
+    my.normalize();
+
+    WPMUtils::writeln(QString(
+            "ncl %1 - command line interface for the Npackd software package manager").
+            arg(my.getVersionString()));
     const char* lines[] = {
-        "Usage:",
-        "    ncl help",
-        "        prints this help",
-        "    ncl add (--package=<package> [--version=<version>])+",
-        "        installs packages. The newest available version will be installed, ",
-        "        if none is specified.",
-        "        Short package names can be used here",
-        "        (e.g. App instead of com.example.App)",
-        "    ncl remove|rm (--package=<package> [--version=<version>])+",
-        "           [--end-process=<types>]",
-        "        removes packages. The version number may be omitted, ",
-        "        if only one is installed.",
-        "        Short package names can be used here",
-        "        (e.g. App instead of com.example.App)",
-        "    ncl update (--package=<package>)+ [--end-process=<types>]",
-        "        updates packages by uninstalling the currently installed",
-        "        and installing the newest version. ",
-        "        Short package names can be used here",
-        "        (e.g. App instead of com.example.App)",
-        "    ncl list [--status=installed | all] [--bare-format]",
-        "        lists package versions sorted by package name and version.",
-        "        Please note that since 1.18 only installed package versions",
-        "        are listed regardless of the --status switch.",
-        "    ncl search [--query=<search terms>] [--status=installed | all]",
-        "            [--bare-format]",
-        "        full text search. Lists found packages sorted by package name.",
-        "        All packages are shown by default.",
-        "    ncl info --package=<package> [--version=<version>]",
-        "        shows information about the specified package or package version",
-        "    ncl path --package=<package> [--versions=<versions>]",
-        "        searches for an installed package and prints its location",
-        "    ncl add-repo --url=<repository>",
-        "        appends a repository to the list",
-        "    ncl remove-repo --url=<repository>",
-        "        removes a repository from the list",
-        "    ncl list-repos",
-        "        list currently defined repositories",
-        "    ncl detect",
-        "        detect packages from the MSI database and software control panel",
+        "Usage: ncl <command> [global options] [options]",
+        "",
+        "Available commands in alphabetical order:",
+        "    ncl add (--package <package>",
+        "            [--version <version> | --versions <versions>])+ ",
+        "            [--file <installation directory>]",
+        "            [--user <user name>] [--password <password>]",
+        "            [--proxy-user <proxy user name>] [--proxy-password <proxy password>]",
+        "            (--url <repository>)*",
+        "        installs packages. The newest available version will be ",
+        "        installed, if none is specified.",
+        "    ncl add-repo --url <repository>",
+        "        appends a repository to the system-wide list of package sources",
+        "    ncl build --package <package> [--version <version> | --versions <versions>])",
+        "            --output-package <package>",
+        "        build a package from another one (e.g. a binary from source code)",
         "    ncl check",
         "        checks the installed packages for missing dependencies",
-        "    ncl which --file=<file>",
-        "        finds the package that owns the specified file or directory",
-        "    ncl set-install-dir --file=<directory>",
-        "        changes the directory where packages will be installed",
-        "    ncl install-dir",
+        "    ncl detect [--user <user name>] [--password <password>]",
+        "            [--proxy-user <proxy user name>] [--proxy-password <proxy password>]",
+        "        download repositories and detect packages from the MSI ",
+        "        database and software control panel",
+        "    ncl info --package <package> [--version <version>]",
+        "            [--bare-format | --json]",
+        "        shows information about the specified package or package version",
+        "    ncl install-dir [--bare-format | --json]",
         "        prints the directory where packages will be installed",
-        "Options:",
+        "    ncl list [--bare-format | --json]",
+        "        lists package versions sorted by package name and version.",
+        "    ncl list-repos [--bare-format | --json]",
+        "        prints the system-wide list of package sources (repositories)",
+        "    ncl help",
+        "        prints this help",
+        "    ncl path (--package <package>",
+        "            [--version <version> | --versions <versions>])+ ",
+        "            [--cmd | --json]",
+        "        searches for installed packages and prints their locations",
+        "    ncl place --package <package>",
+        "            --version <version> --file <directory>",
+        "            [--bare-format | --json]",
+        "        registers a package version installed without Npackd",
+        "    ncl remove|rm (--package <package> [--version <version>])+",
+        "           [--end-process <types>]",
+        "        removes packages. The version number may be omitted, ",
+        "        if only one is installed.",
+        "    ncl remove-scp --title <title>",
+        "        remove a program for the Software Control Panel by title",
+        "    ncl remove-repo --url <repository>",
+        "        removes a repository from the system-wide list of package sources",
+        "    ncl set-repo (--url <repository>)+",
+        "        changes the system-wide list of package sources (repositories)",
+        "    ncl search [--query <search terms>] ",
+        "            [--status installed | updateable | all]",
+        "            [--bare-format | --json]",
+        "            (--url <repository>)*",
+        "        full text search. Lists found packages sorted by package name.",
+        "        All packages are shown by default.",
+        "    ncl set-install-dir [--file <directory>]",
+        "        changes the directory where packages will be installed. The",
+        "        default directory for program files is used if the --file",
+        "        parameter is missing.",
+        "    ncl update (--package <package> [--versions <versions>])+",
+        "            [--query <search terms>]",
+        "            [--end-process <types>]",
+        "            [--install] [--keep-directories]",
+        "            [--file <installation directory>]",
+        "            [--user <user name>] [--password <password>]",
+        "            [--proxy-user <proxy user name>] [--proxy-password <proxy password>]",
+        "            (--url <repository>)*",
+        "        updates packages by uninstalling the currently installed",
+        "        and installing the newest version. ",
+        "    ncl where --file <relative path> [--bare-format | --json]",
+        "        finds all installed packages with the specified file or directory",
+        "    ncl which --file <file> [--bare-format | --json]",
+        "        finds the package that owns the specified file or directory",
     };
-    for (int i = 0; i < (int) (sizeof(lines) / sizeof(lines[0])); i++) {
-        WPMUtils::outputTextConsole(QString(lines[i]) + "\n");
+    for (auto line: lines) {
+        WPMUtils::writeln(QString(line));
     }
-    QStringList opts = this->cl.printOptions();
-    for (int i = 0; i < opts.count(); i++) {
-        WPMUtils::outputTextConsole(opts.at(i) + "\n");
+
+    std::vector<QString> opts = this->cl.printOptions();
+    for (auto& opt: opts) {
+        WPMUtils::writeln(opt);
     }
 
     const char* lines2[] = {
         "",
+        "You can use short package names, e.g. App instead of com.example.App.",
         "The process exits with the code unequal to 0 if an error occures.",
         "If the output is redirected, the texts will be encoded as UTF-8.",
         "",
-        "See https://code.google.com/p/windows-package-manager/wiki/CommandLine for more details.",
+        "See https://github.com/tim-lebedkov/npackd/wiki/CommandLine for more details.",
     };
-    for (int i = 0; i < (int) (sizeof(lines2) / sizeof(lines2[0])); i++) {
-        WPMUtils::outputTextConsole(QString(lines2[i]) + "\n");
+    for (auto line: lines2) {
+        WPMUtils::writeln(QString(line));
     }
+
+    job->completeWithProgress();
 }
 
-QString App::listRepos()
+void App::listRepos(Job* job)
 {
+    bool bare = cl.isPresent("bare-format");
+    bool json = cl.isPresent("json");
+
     QString err;
 
-    QList<QUrl*> urls = AbstractRepository::getRepositoryURLs(&err);
+    std::vector<QUrl*> urls = PackageUtils::getRepositoryURLs(&err);
     if (err.isEmpty()) {
-        WPMUtils::outputTextConsole(QString("%1 repositories are defined:\n\n").
-                arg(urls.size()));
-        for (int i = 0; i < urls.size(); i++) {
-            WPMUtils::outputTextConsole(urls.at(i)->toString() + "\n");
+        if (json) {
+            QJsonObject top;
+            QJsonArray repos;
+            for (auto url: urls) {
+                repos.append(url->toString(QUrl::FullyEncoded));
+            }
+            top["repositories"] = repos;
+
+            printJSON(top);
+        } else {
+            if (!bare) {
+                WPMUtils::writeln(QString("%1 repositories are defined:").
+                        arg(urls.size()));
+                WPMUtils::writeln("");
+            }
+            for (auto url: urls) {
+                WPMUtils::writeln(url->toString(QUrl::FullyEncoded));
+            }
         }
+    } else {
+        job->setErrorMessage(err);
     }
     qDeleteAll(urls);
 
-    return err;
+    job->complete();
 }
 
-QString App::getInstallPath()
+void App::getInstallPath(Job* job)
 {
-    QString err;
+    bool json = cl.isPresent("json");
 
-    WPMUtils::outputTextConsole(WPMUtils::getInstallationDirectory());
+    if (json) {
+        QJsonObject top;
+        top["installDir"] = PackageUtils::getInstallationDirectory();
+        printJSON(top);
+    } else {
+        WPMUtils::outputTextConsole(PackageUtils::getInstallationDirectory());
+    }
 
-    return err;
+    job->complete();
 }
 
-QString App::which()
+void App::which(Job* job)
 {
-    QString r;
+    bool bare = cl.isPresent("bare-format");
+    bool json = cl.isPresent("json");
 
     InstalledPackages* ip = InstalledPackages::getDefault();
-    r = ip->readRegistryDatabase();
+    if (job->shouldProceed()) {
+        QString r = ip->readRegistryDatabase();
+        if (!r.isEmpty())
+            job->setErrorMessage(r);
+    }
+
+    if (job->shouldProceed()) {
+        QString r = DBRepository::getDefault()->openDefault("default", true);
+        if (!r.isEmpty())
+            job->setErrorMessage(r);
+    }
 
     QString file = cl.get("file");
-    if (r.isEmpty()) {
+    if (job->shouldProceed()) {
         if (file.isNull()) {
-            r = "Missing option: --file";
+            job->setErrorMessage("Missing option: --file");
         }
     }
 
-    if (r.isEmpty()) {
+    if (job->shouldProceed()) {
         QFileInfo fi(file);
         InstalledPackageVersion* f = ip->findOwner(fi.absoluteFilePath());
         if (f) {
-            AbstractRepository* rep = AbstractRepository::getDefault_();
+            DBRepository* rep = DBRepository::getDefault();
             Package* p = rep->findPackage_(f->package);
             QString title = p ? p->title : "?";
-            WPMUtils::outputTextConsole(QString(
-                    "%1 %2 (%3) is installed in \"%4\"\n").
-                    arg(title).arg(f->version.getVersionString()).
-                    arg(f->package).arg(f->directory));
+
+            if (json) {
+                QJsonObject top;
+                QJsonObject v;
+                v["package"] = f->package;
+                v["name"] = f->version.getVersionString();
+                v["path"] = f->directory;
+                top["installed"] = v;
+                printJSON(top);
+            } else if (bare) {
+                WPMUtils::writeln(QString(
+                        "%1\t%2\t%3\t%4").
+                        arg(title, f->version.getVersionString(),
+                        f->package, f->directory));
+            } else {
+                WPMUtils::writeln(QString(
+                        "%1 %2 (%3) is installed in \"%4\"").
+                        arg(title, f->version.getVersionString(),
+                        f->package, f->directory));
+            }
+
             delete p;
             delete f;
-        } else
-            WPMUtils::outputTextConsole(QString("No package found for \"%1\"\n").
-                    arg(file));
-    }
-
-    return r;
-}
-
-QString App::setInstallPath()
-{
-    QString r;
-
-    QString file = cl.get("file");
-    if (r.isEmpty()) {
-        if (file.isNull()) {
-            r = "Missing option: --file";
+        } else {
+            if (json)
+                printJSON(QJsonObject());
+            else if (bare)
+                ; // nothing
+            else
+                WPMUtils::writeln(QString("No package found for \"%1\"").
+                        arg(file));
         }
     }
 
-    if (r.isEmpty()) {
-        QFileInfo fi(file);
-        file = fi.absoluteFilePath();
-    }
-
-    if (r.isEmpty()) {
-        r = WPMUtils::checkInstallationDirectory(file);
-    }
-
-    if (r.isEmpty()) {
-        r = WPMUtils::setInstallationDirectory(file);
-    }
-
-    return r;
+    job->complete();
 }
 
-QString App::check()
+void App::where(Job* job)
 {
-    Job* job = clp.createJob();
+    InstalledPackages* ip = InstalledPackages::getDefault();
+    if (job->shouldProceed()) {
+        QString r = ip->readRegistryDatabase();
+        if (!r.isEmpty())
+            job->setErrorMessage(r);
+    }
+
+    QString file = cl.get("file");
+    if (job->shouldProceed()) {
+        if (file.isNull()) {
+            job->setErrorMessage("Missing option: --file");
+        }
+    }
+
+    if (job->shouldProceed()) {
+        bool json = cl.isPresent("json");
+
+        std::vector<QString> paths = ip->getAllInstalledPackagePaths();
+
+        if (json) {
+            QJsonObject top;
+            QJsonArray a;
+            for (auto& path: paths) {
+                QFileInfo fi(path, file);
+                if (fi.exists())
+                    a.append(path + "\\" + file);
+            }
+            top["paths"] = a;
+            printJSON(top);
+        } else {
+            for (auto& path: paths) {
+                QFileInfo fi(path, file);
+                if (fi.exists())
+                    WPMUtils::writeln(path + "\\" + file);
+            }
+        }
+    }
+
+    job->complete();
+}
+
+void App::setInstallPath(Job* job)
+{
+    QString file = cl.get("file");
+    if (job->shouldProceed()) {
+        if (file.isNull()) {
+            file = WPMUtils::getProgramFilesDir();
+        }
+    }
+
+    if (job->shouldProceed()) {
+        QFileInfo fi(file);
+        file = fi.absoluteFilePath();
+        file = WPMUtils::normalizePath(file, false);
+    }
+
+    if (job->shouldProceed()) {
+        QString r = DBRepository::getDefault()->checkInstallationDirectory(file);
+        if (!r.isEmpty())
+            job->setErrorMessage(r);
+    }
+
+    if (job->shouldProceed()) {
+        QString r = PackageUtils::setInstallationDirectory(file);
+        if (!r.isEmpty())
+            job->setErrorMessage(r);
+    }
+
+    // intentionally no success output here
+    /*
+    if (job->shouldProceed()) {
+        qCInfo(npackdImportant()).noquote() << QString(
+                "The installation path was changed successfully to \"%1\"").arg(file);
+    }
+    */
+
+    job->complete();
+}
+
+void App::check(Job* job)
+{
     job->setTitle("Checking dependency integrity for the installed packages");
+
+    if (job->shouldProceed()) {
+        QString err = DBRepository::getDefault()->openDefault();
+        if (!err.isEmpty())
+            job->setErrorMessage(err);
+    }
 
     if (job->shouldProceed()) {
         Job* sub = job->newSubJob(0.01,
@@ -390,12 +648,18 @@ QString App::check()
 
         // ignoring the error message here as "check" should be available
         // for non-admins too
-        InstalledPackages::getDefault()->refresh(DBRepository::getDefault(),
-                sub);
+        InstalledPackages* def = InstalledPackages::getDefault();
+        InstalledPackages ip;
+        ip.refresh(DBRepository::getDefault(), sub);
+        if (sub->shouldProceed()) {
+            *def = ip;
+            def->save();
+        }
     }
 
-    AbstractRepository* rep = AbstractRepository::getDefault_();
-    QList<PackageVersion*> list;
+    DBRepository* rep = DBRepository::getDefault();
+    InstalledPackages* ip = InstalledPackages::getDefault();
+    std::vector<PackageVersion*> list;
 
     if (job->shouldProceed()) {
         QString err;
@@ -412,96 +676,135 @@ QString App::check()
         job->setProgress(1);
 
         int n = 0;
-        for (int i = 0; i < list.count(); i++) {
-            PackageVersion* pv = list.at(i);
-            for (int j = 0; j < pv->dependencies.count(); j++) {
-                Dependency* d = pv->dependencies.at(j);
-                if (!d->isInstalled()) {
-                    WPMUtils::outputTextConsole(QString(
-                            "%1 depends on %2, which is not installed\n").
-                            arg(pv->toString(true)).
-                            arg(d->toString(true)));
+        for (auto pv: list) {
+            for (auto d: pv->dependencies) {
+                if (!ip->isInstalled(*d)) {
+                    WPMUtils::writeln(QString(
+                            "%1 depends on %2, which is not installed").
+                            arg(pv->toString(true),
+                            rep->toString(*d, true)));
                     n++;
                 }
             }
         }
 
-        if (n == 0)
-            WPMUtils::outputTextConsole("All dependencies are installed\n");
-
+        if (n == 0) {
+            qCInfo(npackdImportant()).noquote() << "All dependencies are installed";
+        }
     }
 
     qDeleteAll(list);
 
-    QString r = job->getErrorMessage();
-    delete job;
-
-    return r;
+    job->complete();
 }
 
-QString App::addRepo()
+void App::addRepo(Job* job)
 {
-    QString err;
-
     QString url = cl.get("url").trimmed();
 
-    if (err.isEmpty()) {
+    if (job->shouldProceed()) {
         if (url.isNull()) {
-            err = "Missing option: --url";
+            job->setErrorMessage("Missing option: --url");
         }
     }
 
-    QUrl* url_ = 0;
-    if (err.isEmpty()) {
+    QUrl* url_ = nullptr;
+    if (job->shouldProceed()) {
         url_ = new QUrl();
-        url_->setUrl(url, QUrl::StrictMode);
+        url_->setUrl(url, QUrl::TolerantMode);
         if (!url_->isValid()) {
-            err = "Invalid URL: " + url;
+            job->setErrorMessage("Invalid URL: " + url);
         }
     }
 
-    if (err.isEmpty()) {
-        QList<QUrl*> urls = AbstractRepository::getRepositoryURLs(&err);
+    if (job->shouldProceed()) {
+        QString err;
+        std::vector<QUrl*> urls = PackageUtils::getRepositoryURLs(&err);
         if (err.isEmpty()) {
-            int found = -1;
-            for (int i = 0; i < urls.size(); i++) {
-                if (urls.at(i)->toString() == url_->toString()) {
-                    found = i;
+            bool found = false;
+            for (auto url: urls) {
+                if (url->toString() == url_->toString()) {
+                    found = true;
                     break;
                 }
             }
-            if (found >= 0) {
-                WPMUtils::outputTextConsole(
-                        "This repository is already registered: " + url + "\n");
+            if (found) {
+                WPMUtils::writeln(
+                        "This repository is already registered: " + url);
             } else {
-                urls.append(url_);
-                url_ = 0;
-                AbstractRepository::setRepositoryURLs(urls, &err);
+                urls.push_back(url_);
+                url_ = nullptr;
+                PackageUtils::setRepositoryURLs(urls, &err);
                 if (err.isEmpty())
-                    WPMUtils::outputTextConsole("The repository was added successfully\n");
+                    qCInfo(npackdImportant()).noquote() <<
+                            "The repository was added successfully. Run \"ncl detect\" to update the local database.";
+                else
+                    job->setErrorMessage(err);
             }
+        } else {
+            job->setErrorMessage(err);
         }
         qDeleteAll(urls);
     }
 
     delete url_;
 
-    return err;
+    job->complete();
 }
 
-QString App::list()
+void App::setRepo(Job* job)
 {
-    QString err;
+    std::vector<QString> urls_ = cl.getAll("url");
 
+    if (job->shouldProceed()) {
+        if (urls_.size() == 0) {
+            job->setErrorMessage("Missing option: --url");
+        }
+    }
+
+    if (job->shouldProceed()) {
+        std::vector<QUrl*> urls;
+        for (auto& url: urls_) {
+            if (!job->shouldProceed())
+                break;
+
+            QUrl* url_ = new QUrl();
+            url_->setUrl(url, QUrl::TolerantMode);
+            if (!url_->isValid()) {
+                job->setErrorMessage("Invalid URL: " + url);
+            } else {
+                urls.push_back(url_);
+            }
+        }
+
+        if (job->shouldProceed()) {
+            QString err;
+            PackageUtils::setRepositoryURLs(urls, &err);
+            if (err.isEmpty())
+                qCInfo(npackdImportant()).noquote() <<
+                        "The repositories were changed successfully. Run \"ncl detect\" to update the local database.";
+            else
+                job->setErrorMessage(err);
+        }
+
+        qDeleteAll(urls);
+    }
+
+    job->complete();
+}
+
+void App::list(Job* job)
+{
     bool bare = cl.isPresent("bare-format");
-
-    Job* job;
-    if (bare)
-        job = new Job();
-    else
-        job = clp.createJob();
+    bool json = cl.isPresent("json");
 
     job->setTitle("Listing package versions");
+
+    if (job->shouldProceed()) {
+        QString err = DBRepository::getDefault()->openDefault("default", true);
+        if (!err.isEmpty())
+            job->setErrorMessage(err);
+    }
 
     if (job->shouldProceed()) {
         Job* sub = job->newSubJob(0.01,
@@ -514,68 +817,147 @@ QString App::list()
             sub->completeWithProgress();
     }
 
-    QList<PackageVersion*> list;
-    QStringList titles;
+    std::vector<PackageVersion*> list;
+    std::vector<QString> titles;
 
     if (job->shouldProceed()) {
         Job* sub = job->newSubJob(0.99,
                 "Getting the list of installed packages from the registry");
-        AbstractRepository* rep = AbstractRepository::getDefault_();
+        DBRepository* rep = DBRepository::getDefault();
+
+        QString err;
         list = rep->getInstalled_(&err);
         if (err.isEmpty()) {
             titles = sortPackageVersionsByPackageTitle(&list);
             sub->completeWithProgress();
             job->setProgress(1);
+        } else {
+            job->setErrorMessage(err);
         }
     }
 
-    if (err.isEmpty()) {
-        if (!bare)
-            WPMUtils::outputTextConsole(QString("%1 package versions found:\n\n").
-                    arg(list.count()));
+    if (job->shouldProceed()) {
+        if (json) {
+            QJsonObject top;
+            QJsonArray pvs;
+            for (auto pv: list) {
+                QJsonObject pv_;
+                pv->toJSON(pv_);
+                pvs.append(pv_);
+            }
+            top["versions"] = pvs;
 
-        for (int i = 0; i < list.count(); i++) {
-            PackageVersion* pv = list.at(i);
+            printJSON(top);
+        } else {
             if (!bare)
-                WPMUtils::outputTextConsole(pv->toString() +
-                        " (" + pv->package + ")\n");
-            else
-                WPMUtils::outputTextConsole(pv->package + " " +
-                        pv->version.getVersionString() + " " +
-                        titles.at(i) + "\n");
+                WPMUtils::writeln(QString("%1 package versions found:\r\n").
+                        arg(list.size()));
+
+            for (int i = 0; i < static_cast<int>(list.size()); i++) {
+                PackageVersion* pv = list.at(i);
+                if (!bare)
+                    WPMUtils::writeln(pv->toString() +
+                            " (" + pv->package + ")");
+                else
+                    WPMUtils::writeln(pv->package + " " +
+                            pv->version.getVersionString() + " " +
+                            titles.at(i));
+            }
         }
     }
 
     qDeleteAll(list);
 
-    delete job;
-
-    return err;
+    job->complete();
 }
 
-QString App::search()
+void App::search(Job* job)
 {
     bool bare = cl.isPresent("bare-format");
+    bool json = cl.isPresent("json");
+    std::vector<QString> urls_ = cl.getAll("url");
+    QString user = cl.get("user");
+    QString password = cl.get("password");
+    QString proxyUser = cl.get("proxy-user");
+    QString proxyPassword = cl.get("proxy-password");
     QString query = cl.get("query");
 
-    Job* job = clp.createJob();
     job->setTitle("Searching for packages");
 
-    bool onlyInstalled = false;
+    Package::Status minStatus = Package::INSTALLED;
+    Package::Status maxStatus = Package::INSTALLED;
     if (job->shouldProceed()) {
         QString status = cl.get("status");
         if (!status.isNull()) {
-            if (status == "all")
-                onlyInstalled = false;
-            else if (status == "installed")
-                onlyInstalled = true;
-            else {
+            if (status == "all") {
+                minStatus = Package::INSTALLED;
+                maxStatus = Package::INSTALLED;
+            } else if (status == "installed") {
+                minStatus = Package::INSTALLED;
+                maxStatus = Package::UPDATEABLE;
+            } else if (status == "updateable") {
+                minStatus = Package::UPDATEABLE;
+                maxStatus = Package::NOT_INSTALLED_NOT_AVAILABLE;
+            } else {
                 job->setErrorMessage("Wrong status: " + status);
             }
         }
     }
 
-    DBRepository* rep = DBRepository::getDefault();
+    DBRepository* dbr = DBRepository::getDefault();
+    QTemporaryFile tempFile;
+
+    if (job->shouldProceed()) {
+        if (urls_.size() == 0) {
+            QString err = dbr->openDefault();
+            if (!err.isEmpty())
+                job->setErrorMessage(err);
+            else
+                job->setProgress(0.1);
+        } else {
+            std::vector<QUrl*> urls;
+
+            for (auto& url: urls_) {
+                if (!job->shouldProceed())
+                    break;
+
+                QUrl* url_ = new QUrl();
+                url_->setUrl(url, QUrl::TolerantMode);
+                if (!url_->isValid()) {
+                    job->setErrorMessage("Invalid URL: " + url);
+                } else {
+                    urls.push_back(url_);
+                }
+            }
+
+            if (job->shouldProceed()) {
+                if (!tempFile.open()) {
+                    job->setErrorMessage(QObject::tr("Error creating a temporary file"));
+                } else {
+                    tempFile.close();
+                }
+            }
+
+            if (job->shouldProceed()) {
+                QString err = dbr->open(QStringLiteral("tempdb"),
+                        tempFile.fileName());
+                if (!err.isEmpty()) {
+                    job->setErrorMessage(err);
+                }
+            }
+
+            InstalledPackages::getDefault()->readRegistryDatabase();
+
+            if (job->shouldProceed()) {
+                Job* sub = job->newSubJob(0.10,
+                        QObject::tr("Updating the temporary database"), true, true);
+                dbr->clearAndDownloadRepositories(sub, urls, interactive, user, password, proxyUser, proxyPassword, true, false);
+            }
+
+            qDeleteAll(urls);
+            urls.clear();
+        }
+    }
 
     if (job->shouldProceed()) {
         Job* sub = job->newSubJob(0.96,
@@ -588,12 +970,12 @@ QString App::search()
             sub->completeWithProgress();
     }
 
-    QStringList packageNames;
-    QList<Package*> list;
+    std::vector<QString> packageNames;
+    std::vector<Package*> list;
     if (job->shouldProceed()) {
         Job* sub = job->newSubJob(0.01, "Searching for packages");
         QString err;
-        packageNames = rep->findPackages(Package::INSTALLED, onlyInstalled,
+        packageNames = dbr->findPackages(minStatus, maxStatus,
                 query, -1, -1, &err);
         if (!err.isEmpty())
             job->setErrorMessage(err);
@@ -604,7 +986,7 @@ QString App::search()
     if (job->shouldProceed()) {
         Job* sub = job->newSubJob(0.01, "Fetching packages");
         QString err;
-        list = rep->findPackages(packageNames);
+        list = dbr->findPackages(packageNames);
         if (!err.isEmpty())
             job->setErrorMessage(err);
         else
@@ -612,20 +994,33 @@ QString App::search()
     }
 
     if (job->shouldProceed()) {
-        qSort(list.begin(), list.end(), packageLessThan);
+        std::sort(list.begin(), list.end(), packageLessThan);
 
-        if (!bare)
-            WPMUtils::outputTextConsole(QString("%1 packages found:\n\n").
-                    arg(list.count()));
+        if (json) {
+            QJsonObject top;
 
-        for (int i = 0; i < list.count(); i++) {
-            Package* p = list.at(i);
+            QJsonArray ps;
+            for (auto p: list) {
+                QJsonObject p_;
+                p->toJSON(p_);
+                ps.append(p_);
+            }
+            top["packages"] = ps;
+
+            printJSON(top);
+        } else {
             if (!bare)
-                WPMUtils::outputTextConsole(p->title +
-                        " (" + p->name + ")\n");
-            else
-                WPMUtils::outputTextConsole(p->name + " " +
-                        p->title + "\n");
+                WPMUtils::writeln(QString("%1 packages found:\r\n").
+                        arg(list.size()));
+
+            for (auto p: list) {
+                if (!bare)
+                    WPMUtils::writeln(p->title +
+                            " (" + p->name + ")");
+                else
+                    WPMUtils::writeln(p->name + " " +
+                            p->title);
+            }
         }
 
         qDeleteAll(list);
@@ -633,97 +1028,89 @@ QString App::search()
     }
 
     job->complete();
-    QString err = job->getErrorMessage();
-    delete job;
-
-    return err;
 }
 
-QString App::removeRepo()
+void App::removeRepo(Job* job)
 {
-    QString err;
-
     QString url = cl.get("url");
 
-    if (err.isEmpty()) {
+    if (job->shouldProceed()) {
         if (url.isNull()) {
-            err = "Missing option: --url";
+            job->setErrorMessage("Missing option: --url");
         }
     }
 
-    QUrl* url_ = 0;
-    if (err.isEmpty()) {
+    QUrl* url_ = nullptr;
+    if (job->shouldProceed()) {
         url_ = new QUrl();
-        url_->setUrl(url, QUrl::StrictMode);
+        url_->setUrl(url, QUrl::TolerantMode);
         if (!url_->isValid()) {
-            err = "Invalid URL: " + url;
+            job->setErrorMessage("Invalid URL: " + url);
         }
     }
 
-    if (err.isEmpty()) {
-        QList<QUrl*> urls = AbstractRepository::getRepositoryURLs(&err);
+    if (job->shouldProceed()) {
+        QString err;
+        std::vector<QUrl*> urls = PackageUtils::getRepositoryURLs(&err);
         if (err.isEmpty()) {
-            int found = -1;
-            for (int i = 0; i < urls.size(); i++) {
-                if (urls.at(i)->toString() == url_->toString()) {
-                    found = i;
+            bool found = false;
+            for (auto url: urls) {
+                if (url->toString() == url_->toString()) {
+                    found = true;
                     break;
                 }
             }
-            if (found < 0) {
-                WPMUtils::outputTextConsole(
+            if (!found) {
+                WPMUtils::writeln(
                         "The repository was not in the list: " +
-                        url + "\n");
+                        url);
             } else {
-                delete urls.takeAt(found);
-                AbstractRepository::setRepositoryURLs(urls, &err);
+                delete urls.at(found);
+                urls.erase(urls.begin() + found);
+                PackageUtils::setRepositoryURLs(urls, &err);
                 if (err.isEmpty())
-                    WPMUtils::outputTextConsole(
-                            "The repository was removed successfully\n");
+                    qCInfo(npackdImportant()).noquote() <<
+                            "The repository was removed successfully. Run \"ncl detect\" to update the local database.";
+                else
+                    job->setErrorMessage(err);
             }
+        } else {
+            job->setErrorMessage(err);
         }
         qDeleteAll(urls);
     }
 
     delete url_;
 
-    return err;
+    job->complete();
 }
 
-QString App::path()
+void App::path(Job* job)
 {
-    Job* job = new Job();
-
-    QString package = cl.get("package");
-    QString versions = cl.get("versions");
-
     if (job->shouldProceed()) {
-        if (package.isNull()) {
-            job->setErrorMessage("Missing option: --package");
-        }
+        QString err = DBRepository::getDefault()->openDefault();
+        if (!err.isEmpty())
+            job->setErrorMessage(err);
     }
 
     if (job->shouldProceed()) {
-        if (!Package::isValidName(package)) {
-            job->setErrorMessage("Invalid package name: " + package);
-        }
+        Job* sub = job->newSubJob(0.1,
+                "Reading list of installed packages from the registry");
+        InstalledPackages* ip = InstalledPackages::getDefault();
+        QString err = ip->readRegistryDatabase();
+        if (!err.isEmpty())
+            job->setErrorMessage(err);
+        else
+            sub->completeWithProgress();
     }
 
-    Dependency d;
-    if (job->shouldProceed()) {
-        // debug: WPMUtils::outputTextConsole <<  package) << " " << versions);
-        d.package = package;
-        if (versions.isNull()) {
-            d.min.setVersion(0, 0);
-            d.max.setVersion(std::numeric_limits<int>::max(), 0);
-        } else {
-            if (!d.setVersions(versions)) {
-                job->setErrorMessage("Cannot parse versions: " +
-                        versions);
-            }
-        }
-    }
+    QString err;
+    std::vector<InstalledPackageVersion*> ipvs =
+            PackageVersion::getPathPackageVersionOptions(cl, &err);
+    if (!err.isEmpty())
+        job->setErrorMessage(err);
 
+/*
     QString path;
     if (job->shouldProceed()) {
         // no long-running operation can be done here.
@@ -734,7 +1121,7 @@ QString App::path()
     if (job->shouldProceed() && path.isEmpty() && !package.contains('.')) {
         QString err = DBRepository::getDefault()->openDefault("default", true);
         if (err.isEmpty()) {
-            Package* p = WPMUtils::findOnePackage(package, &err);
+            Package* p = AbstractRepository::findOnePackage(package, &err);
             if (!err.isEmpty()) {
                 delete p;
                 p = 0;
@@ -750,49 +1137,187 @@ QString App::path()
             job->setErrorMessage(err);
         }
     }
+    */
 
-    if (!path.isEmpty()) {
-        path.replace('/', '\\');
-        WPMUtils::outputTextConsole(path + "\n");
-    }
+    if (err.isEmpty()) {
+        std::vector<QString> paths;
+        for (auto ipv: ipvs) {
+            paths.push_back(ipv->getDirectory().replace('/', '\\'));
+        }
 
-    job->complete();
-
-    QString r = job->getErrorMessage();
-
-    delete job;
-
-    return r;
-}
-
-QString App::update()
-{
-    DBRepository* rep = DBRepository::getDefault();
-    Job* job = clp.createJob();
-    job->setTitle("Updating packages");
-
-    if (job->shouldProceed()) {
-        Job* sub = job->newSubJob(0.01,
-                "Reading list of installed packages from the registry");
-        InstalledPackages* ip = InstalledPackages::getDefault();
-        QString err = ip->readRegistryDatabase();
-        if (!err.isEmpty())
-            job->setErrorMessage(err);
-        else
-            sub->completeWithProgress();
-    }
-
-    if (job->shouldProceed()) {
-        Job* rjob = job->newSubJob(0.05,
-                "Detecting installed software");
-        InstalledPackages::getDefault()->refresh(DBRepository::getDefault(),
-                rjob);
-        if (!rjob->getErrorMessage().isEmpty()) {
-            job->setErrorMessage(rjob->getErrorMessage());
+        if (cl.isPresent("json")) {
+            QJsonObject top;
+            QJsonArray path;
+            for (auto&& p: paths) {
+                path.append(p);
+            }
+            top["path"] = path;
+            printJSON(top);
+        } else if (cl.isPresent("cmd")) {
+            for (int i = 0; i < static_cast<int>(paths.size()); i++) {
+                WPMUtils::writeln(QString("set npackd_path") +
+                        QString::number(i) + "=" + paths.at(i));
+            }
+        } else {
+            for (auto& path: paths) {
+                WPMUtils::writeln(path);
+            }
         }
     }
 
-    int programCloseType = WPMUtils::CLOSE_WINDOW;
+    job->complete();
+}
+
+void App::place(Job* job)
+{
+    QString package = cl.get("package");
+    QString version = cl.get("version");
+    QString where = cl.get("file");
+
+    if (job->shouldProceed()) {
+        if (package.isNull()) {
+            job->setErrorMessage("Missing option: --package");
+        }
+    }
+
+    if (job->shouldProceed()) {
+        if (!Package::isValidName(package)) {
+            job->setErrorMessage("Invalid package name: " + package);
+        }
+    }
+
+    if (job->shouldProceed()) {
+        if (version.isNull()) {
+            job->setErrorMessage("Missing option: --version");
+        }
+    }
+
+    Version version_;
+    if (job->shouldProceed()) {
+        if (!version_.setVersion(version)) {
+            job->setErrorMessage("Invalid version number: " + version);
+        }
+    }
+
+    if (job->shouldProceed()) {
+        if (where.isNull()) {
+            job->setErrorMessage("Missing option: --file");
+        }
+    }
+
+    if (job->shouldProceed()) {
+        QFileInfo fi(where);
+        if (!fi.exists()) {
+            job->setErrorMessage("Directory does not exist: " + where);
+        } else if (!fi.isDir()) {
+            job->setErrorMessage("Not a directory: " + where);
+        }
+    }
+
+    InstalledPackages* ip = InstalledPackages::getDefault();
+    if (job->shouldProceed()) {
+        QString err = ip->readRegistryDatabase();
+        if (!err.isEmpty()) {
+            job->setErrorMessage(err);
+        } else {
+            job->setProgress(0.1);
+        }
+    }
+
+    if (job->shouldProceed()) {
+        QString err = DBRepository::getDefault()->openDefault();
+        if (!err.isEmpty()) {
+            job->setErrorMessage(err);
+        } else {
+            job->setProgress(0.2);
+        }
+    }
+
+    if (job->shouldProceed()) {
+        QFileInfo fi(where);
+        InstalledPackageVersion* f = ip->findOwner(fi.absoluteFilePath());
+        if (f) {
+            DBRepository* rep = DBRepository::getDefault();
+            Package* p = rep->findPackage_(f->package);
+            QString title = p ? p->title : "?";
+            job->setErrorMessage(QString(
+                    "%1 %2 (%3) is installed in \"%4\"").
+                    arg(title, f->version.getVersionString(),
+                    f->package, f->directory));
+            delete p;
+            delete f;
+        }
+    }
+
+    bool success = false;
+    if (job->shouldProceed()) {
+        QString err = InstalledPackages::getDefault()->setPackageVersionPath(
+                package, version_, where);
+        if (!err.isEmpty())
+            job->setErrorMessage(err);
+        else {
+            job->setProgress(0.7);
+            success = true;
+        }
+    }
+
+    if (job->shouldProceed()) {
+        DBRepository* rep = DBRepository::getDefault();
+
+        Package* p = new Package(package, package);
+        rep->savePackage(p, false);
+        delete p;
+
+        PackageVersion* pv = new PackageVersion(package, version_);
+        rep->savePackageVersion(pv, false);
+        delete pv;
+    }
+
+    if (job->shouldProceed()) {
+        QString err = DBRepository::getDefault()->updateStatus(package);
+        if (!err.isEmpty()) {
+            job->setErrorMessage(err);
+        } else {
+            job->setProgress(0.99);
+        }
+    }
+
+    if (success) {
+        QString msg = QString(
+                "The package %1 %2 was placed successfully in \"%3\"").
+                arg(package, version, where);
+        qCInfo(npackdImportant()).noquote() << msg;
+    }
+
+    if (job->shouldProceed())
+        job->setProgress(1);
+
+    job->complete();
+}
+
+void App::update(Job* job)
+{
+    CoInitialize(nullptr);
+    DBRepository* rep = DBRepository::getDefault();
+    job->setTitle("Updating packages");
+
+    if (job->shouldProceed()) {
+        QString err = InstalledPackages::getDefault()->readRegistryDatabase();
+        if (!err.isEmpty()) {
+            job->setErrorMessage(err);
+        } else {
+            job->setProgress(0.05);
+        }
+    }
+
+    std::vector<QString> urls_ = cl.getAll("url");
+    QString user = cl.get("user");
+    QString password = cl.get("password");
+    QString proxyUser = cl.get("proxy-user");
+    QString proxyPassword = cl.get("proxy-password");
+    QString query = cl.get("query");
+
+    DWORD programCloseType = WPMUtils::CLOSE_WINDOW;
     if (job->shouldProceed()) {
         QString err;
         programCloseType = WPMUtils::getProgramCloseType(cl, &err);
@@ -801,7 +1326,97 @@ QString App::update()
         }
     }
 
-    QStringList packages_ = cl.getAll("package");
+    QTemporaryFile tempFile;
+
+    if (job->shouldProceed()) {
+        if (urls_.size() == 0) {
+            QString err = rep->openDefault();
+            if (!err.isEmpty())
+                job->setErrorMessage(err);
+            else
+                job->setProgress(0.1);
+        } else {
+            std::vector<QUrl*> urls;
+
+            for (auto& url: urls_) {
+                if (!job->shouldProceed())
+                    break;
+
+                QUrl* url_ = new QUrl();
+                url_->setUrl(url, QUrl::TolerantMode);
+                if (!url_->isValid()) {
+                    job->setErrorMessage("Invalid URL: " + url);
+                } else {
+                    urls.push_back(url_);
+                }
+            }
+
+            if (job->shouldProceed()) {
+                if (!tempFile.open()) {
+                    job->setErrorMessage(QObject::tr("Error creating a temporary file"));
+                } else {
+                    tempFile.close();
+                }
+            }
+
+            if (job->shouldProceed()) {
+                QString err = rep->open(QStringLiteral("tempdb"),
+                        tempFile.fileName());
+                if (!err.isEmpty()) {
+                    job->setErrorMessage(err);
+                }
+            }
+
+            if (job->shouldProceed()) {
+                Job* sub = job->newSubJob(0.10,
+                        QObject::tr("Updating the temporary database"), true, true);
+                rep->clearAndDownloadRepositories(sub, urls, interactive, user,
+                        password, proxyUser, proxyPassword, true, false);
+            }
+
+            qDeleteAll(urls);
+            urls.clear();
+        }
+    }
+
+    // the lengths of these vectors are the same
+    std::vector<QString> packages_;
+    std::vector<QString> versions_;
+
+    std::vector<CommandLine::ParsedOption*> parsed = cl.getParsedOptions();
+    for (int i = 0; i < static_cast<int>(parsed.size()); ) {
+        CommandLine::ParsedOption* po = parsed.at(i);
+        if (po->opt && po->opt->name == "package") {
+            packages_.push_back(po->value);
+            i++;
+
+            QString versions;
+            if (i < static_cast<int>(parsed.size())) {
+                po = parsed.at(i);
+                if (po->opt && po->opt->name == "versions") {
+                    versions = po->value;
+                    i++;
+                }
+            }
+            versions_.push_back(versions);
+        } else if (po->opt && po->opt->name == "versions") {
+            job->setErrorMessage("Missing option: --versions without --package");
+            break;
+        } else {
+            i++;
+        }
+    }
+
+    // process --query
+    if (job->shouldProceed()) {
+        if (!query.isNull()) {
+            QString err;
+            std::vector<QString> list = rep->findPackages(Package::Status::UPDATEABLE,
+                    Package::Status::NOT_INSTALLED_NOT_AVAILABLE, query, -1, -1, &err);
+            packages_.insert(packages_.end(), list.begin(), list.end());
+            versions_.resize(packages_.size());
+        }
+    }
 
     if (job->shouldProceed()) {
         if (packages_.size() == 0) {
@@ -810,52 +1425,102 @@ QString App::update()
     }
 
     if (job->shouldProceed()) {
-        for (int i = 0; i < packages_.size(); i++) {
-            QString package = packages_.at(i);
+        for (auto& package: packages_) {
             if (!Package::isValidName(package)) {
                 job->setErrorMessage("Invalid package name: " + package);
             }
         }
     }
 
-    QList<Package*> toUpdate;
+    QString file = cl.get("file");
+    if (job->shouldProceed()) {
+        if (!file.isNull()) {
+            QDir d;
+            file = WPMUtils::normalizePath(d.absoluteFilePath(file), false);
+
+            if (packages_.size() != 1) {
+                job->setErrorMessage(
+                        "The installation directory can only be specified if one package should be updated.");
+            }
+        }
+    }
+
+    std::vector<Package*> toUpdate;
+    std::vector<Dependency*> toUpdate2;
 
     if (job->shouldProceed()) {
-        for (int i = 0; i < packages_.size(); i++) {
+        for (int i = 0; i < static_cast<int>(packages_.size()); i++) {
             QString package = packages_.at(i);
-            QList<Package*> packages;
-            if (package.contains('.')) {
-                Package* p = rep->findPackage_(package);
-                if (p)
-                    packages.append(p);
-            } else {
-                packages = rep->findPackagesByShortName(package);
-            }
+            QString versions = versions_.at(i);
 
-            if (job->shouldProceed()) {
-                if (packages.count() == 0) {
-                    job->setErrorMessage("Unknown package: " + package);
-                } else if (packages.count() > 1) {
-                    job->setErrorMessage("Ambiguous package name");
+            QString err;
+            Package* p = rep->findOnePackage(package, &err);
+            if (!p) {
+                qCDebug(npackd) << "did not found a package" << package;
+
+                job->setErrorMessage(err);
+            } else {
+                qCDebug(npackd) << "found a package" << p->name;
+
+                if (versions.isEmpty()) {
+                    qCDebug(npackd) << "using the package" << p->name;
+
+                    toUpdate.push_back(p);
                 } else {
-                    toUpdate.append(packages.at(0)->clone());
+                    qCDebug(npackd) << "using version range" << versions;
+
+                    Dependency* d = new Dependency();
+                    if (!d->setVersions(versions)) {
+                        delete d;
+                        job->setErrorMessage(QString(
+                            "Invalid version range: %1").arg(versions));
+                    } else {
+                        // this package name could be different from the one in
+                        // the command line if the short package name is used
+                        d->package = p->name;
+
+                        toUpdate2.push_back(d);
+
+                        // WPMUtils::writeln(d->toString());
+                    }
+
+                    delete p;
                 }
             }
-
-            qDeleteAll(packages);
 
             if (!job->shouldProceed())
                 break;
         }
     }
 
-    QList<InstallOperation*> ops;
+    bool keepDirectories = cl.isPresent("keep-directories");
+    bool install = cl.isPresent("install");
+
+    std::vector<InstallOperation*> ops;
+    DAG opsDependencies;
+    InstalledPackages installed(*InstalledPackages::getDefault());
+
+    if (job->shouldProceed()) {
+        QString err = DBRepository::getDefault()->planAddMissingDeps(
+                installed, ops, opsDependencies);
+        if (!err.isEmpty())
+            job->setErrorMessage(err);
+    }
+
     bool up2date = false;
     if (job->shouldProceed()) {
-        QString err = rep->planUpdates(toUpdate, ops);
+        qCDebug(npackd) << "planning updates for" << toUpdate.size() <<
+                "packages and " << toUpdate2.size() << "version ranges";
+
+        QString err = rep->planUpdates(installed, toUpdate, toUpdate2, ops,
+                opsDependencies,
+                keepDirectories, install, file);
         if (!err.isEmpty())
             job->setErrorMessage(err);
         else {
+            qCDebug(npackd) << "the update plan contains" << ops.size() <<
+                    "operations";
+
             job->setProgress(0.15);
             up2date = ops.size() == 0;
         }
@@ -876,7 +1541,9 @@ QString App::update()
 
     if (job->shouldProceed() && !up2date) {
         Job* ijob = job->newSubJob(0.85, "Updating");
-        processInstallOperations(ijob, ops, programCloseType);
+        processInstallOperations(ijob, rep, ops, opsDependencies,
+                programCloseType, interactive,
+                user, password, proxyUser, proxyPassword);
         if (!ijob->getErrorMessage().isEmpty()) {
             job->setErrorMessage(QString("Error updating: %1").
                     arg(ijob->getErrorMessage()));
@@ -884,29 +1551,29 @@ QString App::update()
     }
     qDeleteAll(ops);
 
-    job->complete();
-
-    QString r = job->getErrorMessage();
-    if (job->isCancelled()) {
-        r = "The package update was cancelled";
-    } else if (up2date) {
-        WPMUtils::outputTextConsole("The packages are already up-to-date\n");
-    } else if (r.isEmpty()) {
-        WPMUtils::outputTextConsole("The packages were updated successfully\n");
+    if (job->shouldProceed()) {
+        if (up2date) {
+            WPMUtils::writeln("The packages are already up-to-date");
+        } else if (job->getErrorMessage().isEmpty()) {
+            qCInfo(npackdImportant()).noquote() <<
+                    "The packages were updated successfully";
+        }
     }
 
-    delete job;
-
     qDeleteAll(toUpdate);
+    qDeleteAll(toUpdate2);
 
-    return r;
+    job->complete();
+    CoUninitialize();
 }
 
 void App::processInstallOperations(Job *job,
-        const QList<InstallOperation *> &ops, DWORD programCloseType)
+        DBRepository* rep,
+        const std::vector<InstallOperation *> &ops,
+        const DAG& opsDependencies, DWORD programCloseType,
+        bool interactive, const QString user, const QString password,
+        const QString proxyUser, const QString proxyPassword)
 {
-    DBRepository* rep = DBRepository::getDefault();
-
     if (rep->includesRemoveItself(ops)) {
         QString newExe;
 
@@ -926,14 +1593,14 @@ void App::processInstallOperations(Job *job,
                 } else {
                     of.close();
 
-                    // qDebug() << "self-update 1";
+                    // qCDebug(npackd) << "self-update 1";
 
                     if (!QFile::copy(thisExe, newExe))
                         job->setErrorMessage("Error copying the binary");
                     else
                         sub->completeWithProgress();
 
-                    // qDebug() << "self-update 2";
+                    // qCDebug(npackd) << "self-update 2";
                 }
             }
         }
@@ -941,9 +1608,8 @@ void App::processInstallOperations(Job *job,
         QString batchFileName;
         if (job->shouldProceed()) {
             QString pct = WPMUtils::programCloseType2String(programCloseType);
-            QStringList batch;
-            for (int i = 0; i < ops.count(); i++) {
-                InstallOperation* op = ops.at(i);
+            std::vector<QString> batch;
+            for (auto op: ops) {
                 QString oneCmd = "\"" + newExe + "\" ";
 
                 // ping 1.1.1.1 always fails => we use || instead of &&
@@ -957,10 +1623,10 @@ void App::processInstallOperations(Job *job,
                             " -e " + pct +
                             " || ping 1.1.1.1 -n 1 -w 10000 > nul || exit /b %errorlevel%";
                 }
-                batch.append(oneCmd);
+                batch.push_back(oneCmd);
             }
 
-            // qDebug() << "self-update 3";
+            // qCDebug(npackd) << "self-update 3";
 
             QTemporaryFile file(QDir::tempPath() +
                               "\\npackdclXXXXXX.bat");
@@ -970,16 +1636,16 @@ void App::processInstallOperations(Job *job,
             else {
                 batchFileName = file.fileName();
 
-                // qDebug() << "batch" << file.fileName();
+                // qCDebug(npackd) << "batch" << file.fileName();
 
                 QTextStream stream(&file);
                 stream.setCodec("UTF-8");
-                stream << batch.join("\r\n");
+                stream << WPMUtils::join(batch, "\r\n");
                 if (stream.status() != QTextStream::Ok)
                     job->setErrorMessage("Error writing the .bat file");
                 file.close();
 
-                // qDebug() << "self-update 4";
+                // qCDebug(npackd) << "self-update 4";
 
                 job->setProgress(0.9);
             }
@@ -991,10 +1657,11 @@ void App::processInstallOperations(Job *job,
             file_.replace('/', '\\');
             QString prg = WPMUtils::findCmdExe();
             QString args = "/U /E:ON /V:OFF /C \"\"" + file_ + "\"\"";
+            QString winDir = WPMUtils::getWindowsDir();
 
-            WPMUtils::outputTextConsole(
-                    (QObject::tr("Starting update process %1 with parameters %2") + "\n").
-                    arg(prg).arg(args));
+            WPMUtils::writeln(
+                    (QObject::tr("Starting update process %1 with parameters %2")).
+                    arg(prg, args));
 
             args = "\"" + prg + "\" " + args;
 
@@ -1002,10 +1669,12 @@ void App::processInstallOperations(Job *job,
             PROCESS_INFORMATION pinfo;
 
             STARTUPINFOW startupInfo = {
-                sizeof(STARTUPINFO), 0, 0, 0,
-                (ulong) CW_USEDEFAULT, (ulong) CW_USEDEFAULT,
-                (ulong) CW_USEDEFAULT, (ulong) CW_USEDEFAULT,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+                sizeof(STARTUPINFO), nullptr, nullptr, nullptr,
+                static_cast<DWORD>(CW_USEDEFAULT),
+                static_cast<DWORD>(CW_USEDEFAULT),
+                static_cast<DWORD>(CW_USEDEFAULT),
+                static_cast<DWORD>(CW_USEDEFAULT),
+                0, 0, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr
             };
 
             // we do to not use CREATE_UNICODE_ENVIRONMENT here to not start
@@ -1013,19 +1682,19 @@ void App::processInstallOperations(Job *job,
             // normally the case if you start cmd.exe from the Windows start
             // menu
             success = CreateProcess(
-                    (wchar_t*) prg.utf16(),
-                    (wchar_t*) args.utf16(),
-                    0, 0, TRUE,
-                    0 /*CREATE_UNICODE_ENVIRONMENT*/, 0,
-                    0, &startupInfo, &pinfo);
+                    WPMUtils::toLPWSTR(prg),
+                    WPMUtils::toLPWSTR(args),
+                    nullptr, nullptr, TRUE,
+                    0 /*CREATE_UNICODE_ENVIRONMENT*/, nullptr,
+                    WPMUtils::toLPWSTR(winDir), &startupInfo, &pinfo);
 
             if (success) {
                 CloseHandle(pinfo.hThread);
                 CloseHandle(pinfo.hProcess);
-                // qDebug() << "success!222";
+                // qCDebug(npackd) << "success!222";
             }
 
-            // qDebug() << "self-update 5";
+            // qCDebug(npackd) << "self-update 5";
 
             sub->completeWithProgress();
             job->setProgress(1);
@@ -1033,109 +1702,286 @@ void App::processInstallOperations(Job *job,
 
         job->complete();
     } else {
-        rep->process(job, ops, programCloseType);
+        rep->process(job, ops, opsDependencies,
+                programCloseType, debug, interactive, user,
+                password, proxyUser, proxyPassword);
     }
 }
 
-QString App::add()
+void App::build(Job* job)
 {
-    Job* job = clp.createJob();
-    job->setTitle("Installing packages");
+    job->setTitle("Building a package");
 
+    DBRepository* rep = DBRepository::getDefault();
     if (job->shouldProceed()) {
-        Job* sub = job->newSubJob(0.01,
-                "Reading list of installed packages from the registry");
-        InstalledPackages* ip = InstalledPackages::getDefault();
-        QString err = ip->readRegistryDatabase();
+        QString err = rep->openDefault();
         if (!err.isEmpty())
             job->setErrorMessage(err);
-        else
-            sub->completeWithProgress();
     }
 
     if (job->shouldProceed()) {
-        Job* rjob = job->newSubJob(0.09,
-                "Detecting installed software");
-        InstalledPackages::getDefault()->refresh(DBRepository::getDefault(),
-                rjob);
-        if (!rjob->getErrorMessage().isEmpty()) {
-            job->setErrorMessage(rjob->getErrorMessage());
+        /* we ignore the returned error as it should also work for non-admins */
+        addNpackdCL(rep);
+    }
+
+    InstalledPackages* ip = InstalledPackages::getDefault();
+
+    if (job->shouldProceed()) {
+        QString err = ip->readRegistryDatabase();
+        if (!err.isEmpty()) {
+            job->setErrorMessage(err);
+        } else {
+            job->setProgress(0.1);
         }
     }
 
-    QString err;
-    QList<PackageVersion*> toInstall =
-            WPMUtils::getPackageVersionOptions(cl, &err, true);
-    if (!err.isEmpty())
-        job->setErrorMessage(err);
+    std::unique_ptr<Dependency> sourceDep;
 
-    // debug: WPMUtils::outputTextConsole << "Versions: " << d.toString()) << std::endl;
-    QList<InstallOperation*> ops;
     if (job->shouldProceed()) {
         QString err;
-        QList<PackageVersion*> installed =
-                AbstractRepository::getDefault_()->getInstalled_(&err);
+        std::vector<Dependency*> pvs =
+                PackageUtils::getPackageVersionOptions(cl, &err);
         if (!err.isEmpty())
             job->setErrorMessage(err);
+        else if (pvs.size() != 1)
+            job->setErrorMessage(
+                    QObject::tr("Exactly one source package version should be specified"));
+        else {
+            sourceDep.reset(pvs.at(0));
+            pvs.erase(pvs.begin());
+        }
 
-        QList<PackageVersion*> avoid;
-        for (int i = 0; i < toInstall.size(); i++) {
-            PackageVersion* pv = toInstall.at(i);
+        qDeleteAll(pvs);
+    }
+
+    std::unique_ptr<InstalledPackageVersion> source;
+    if (job->shouldProceed()) {
+        source.reset(ip->findHighestInstalledMatch(*sourceDep));
+        if (!source)
+            job->setErrorMessage(
+                    QObject::tr("The installed source package version was not found"));
+    }
+
+    QString outputPackage;
+    if (job->shouldProceed()) {
+        outputPackage = cl.get("output-package");
+        if (outputPackage.isNull()) {
+            job->setErrorMessage("Missing option: --output-package");
+        }
+    }
+
+    std::unique_ptr<PackageVersion> pv;
+    if (job->shouldProceed()) {
+        QString err;
+        pv.reset(rep->findPackageVersion_(source->package, source->version,
+                &err));
+        if (!err.isEmpty())
+            job->setErrorMessage(err);
+        else if (!pv)
+            job->setErrorMessage(QObject::tr("The source package version was not found"));
+    }
+
+    QString outputDir;
+    if (job->shouldProceed()) {
+        std::unique_ptr<PackageVersion> output(new PackageVersion(outputPackage,
+                pv->version));
+        outputDir = output->getPreferredInstallationDirectory();
+        if (!QDir().mkpath(outputDir))
+            job->setErrorMessage(QObject::tr("Cannot create the directory %1").
+                    arg(outputDir));
+    }
+
+    if (job->shouldProceed()) {
+        Job* sub = job->newSubJob(0.8, QObject::tr("Build package"), true, true);
+        pv->build(sub, outputPackage, outputDir, true);
+    }
+
+    if (job->shouldProceed()) {
+        qCInfo(npackdImportant()).noquote() << QObject::tr(
+                "The package %1 was built successfully in %2 to %3").arg(
+                pv->toString(), outputDir, outputPackage);
+    }
+
+    job->complete();
+}
+
+void App::add(Job* job)
+{
+    CoInitialize(nullptr);
+    job->setTitle("Installing packages");
+
+    std::vector<QString> urls_ = cl.getAll("url");
+    QString user = cl.get("user");
+    QString password = cl.get("password");
+    QString proxyUser = cl.get("proxy-user");
+    QString proxyPassword = cl.get("proxy-password");
+
+    DBRepository* dbr = DBRepository::getDefault();
+    QTemporaryFile tempFile;
+
+    if (job->shouldProceed()) {
+        if (urls_.size() == 0) {
+            QString err = dbr->openDefault();
+            if (!err.isEmpty())
+                job->setErrorMessage(err);
+            else
+                job->setProgress(0.1);
+        } else {
+            std::vector<QUrl*> urls;
+
+            for (auto& url: urls_) {
+                if (!job->shouldProceed())
+                    break;
+
+                QUrl* url_ = new QUrl();
+                url_->setUrl(url, QUrl::TolerantMode);
+                if (!url_->isValid()) {
+                    job->setErrorMessage("Invalid URL: " + url);
+                } else {
+                    urls.push_back(url_);
+                }
+            }
+
+            if (job->shouldProceed()) {
+                if (!tempFile.open()) {
+                    job->setErrorMessage(QObject::tr("Error creating a temporary file"));
+                } else {
+                    tempFile.close();
+                }
+            }
+
+            if (job->shouldProceed()) {
+                QString err = dbr->open(QStringLiteral("tempdb"),
+                        tempFile.fileName());
+                if (!err.isEmpty()) {
+                    job->setErrorMessage(err);
+                }
+            }
+
+            if (job->shouldProceed()) {
+                Job* sub = job->newSubJob(0.10,
+                        QObject::tr("Updating the temporary database"), true, true);
+                dbr->clearAndDownloadRepositories(sub, urls, interactive, user, password, proxyUser, proxyPassword, true, false);
+            }
+
+            qDeleteAll(urls);
+            urls.clear();
+        }
+    }
+
+    if (job->shouldProceed()) {
+        /* we ignore the returned error as it should also work for non-admins */
+        addNpackdCL(dbr);
+    }
+
+    InstalledPackages* ip = InstalledPackages::getDefault();
+
+    if (job->shouldProceed()) {
+        QString err = ip->readRegistryDatabase();
+        if (!err.isEmpty()) {
+            job->setErrorMessage(err);
+        } else {
+            job->setProgress(0.1);
+        }
+    }
+
+    std::vector<PackageVersion*> toInstall;
+
+    if (job->shouldProceed()) {
+        QString err;
+        toInstall = PackageUtils::getAddPackageVersionOptions(*dbr, cl, &err);
+        if (!err.isEmpty())
+            job->setErrorMessage(err);
+    }
+
+    QString file = cl.get("file");
+    if (job->shouldProceed()) {
+        if (!file.isNull()) {
+            QDir d;
+            file = WPMUtils::normalizePath(d.absoluteFilePath(file), false);
+
+            if (toInstall.size() != 1) {
+                job->setErrorMessage(
+                        "The installation directory can only be specified if one package version should be installed.");
+            } else {
+                PackageVersion* pv = toInstall.at(0);
+                QString ip_ = ip->getPath(pv->package, pv->version);
+
+                if (pv->installed() && !WPMUtils::pathEquals(ip_, file)) {
+                    job->setErrorMessage(QString(
+                            "The package version %1 is already installed in \"%2\"").
+                            arg(pv->toString(), ip_));
+                }
+            }
+        }
+    }
+
+    // debug: WPMUtils::outputTextConsole << "Versions: " << d.toString()) << std::endl;
+    std::vector<InstallOperation*> ops;
+    DAG opsDependencies;
+    InstalledPackages installed(*ip);
+
+    if (job->shouldProceed()) {
+        QString err;
+        err = dbr->planAddMissingDeps(installed, ops, opsDependencies);
+        if (!err.isEmpty())
+            job->setErrorMessage(err);
+    }
+
+    if (job->shouldProceed()) {
+        QString err;
+
+        std::vector<PackageVersion*> avoid;
+        for (auto pv: toInstall) {
             if (job->shouldProceed())
-                err = pv->planInstallation(installed, ops, avoid);
+                err = dbr->planInstallation(installed, pv,
+                        ops, opsDependencies, avoid, file);
             if (!err.isEmpty()) {
                 job->setErrorMessage(err);
             }
         }
-        qDeleteAll(installed);
     }
 
-    // debug: WPMUtils::outputTextConsole(QString("%1\n").arg(ops.size()));
+    //qCInfo(npackd) << "err" << job->getErrorMessage();
+
+    // debug: WPMUtils::outputTextConsole(QString("%1\r\n").arg(ops.size()));
 
     if (job->shouldProceed() && ops.size() > 0) {
-        Job* ijob = job->newSubJob(0.9, "Installing");
-        processInstallOperations(ijob, ops, WPMUtils::CLOSE_WINDOW);
+        Job* ijob = job->newSubJob(0.8, "Installing");
+        processInstallOperations(ijob, dbr, ops, opsDependencies,
+                WPMUtils::CLOSE_WINDOW,
+                interactive, user, password, proxyUser, proxyPassword);
         if (!ijob->getErrorMessage().isEmpty())
             job->setErrorMessage(QString("Error installing: %1").
                     arg(ijob->getErrorMessage()));
     }
 
-    job->complete();
-
-    QString r = job->getErrorMessage();
-    if (r.isEmpty()) {
-        for (int i = 0; i < toInstall.size(); i++) {
-            PackageVersion* pv = toInstall.at(i);
-            WPMUtils::outputTextConsole(QString(
-                    "The package %1 was installed successfully in %2\n").arg(
-                    pv->toString()).arg(pv->getPath()));
-        }
+    if (job->shouldProceed()) {
+        qCInfo(npackdImportant()).noquote() << "The packages were installed successfully";
     }
-
-    delete job;
 
     qDeleteAll(ops);
     qDeleteAll(toInstall);
 
-    return r;
+    job->complete();
+    CoUninitialize();
 }
 
-bool App::confirm(const QList<InstallOperation*> install, QString* title,
+bool App::confirm(const std::vector<InstallOperation*> install, QString* title,
         QString* err)
 {
     *err = "";
 
     QString names;
-    for (int i = 0; i < install.count(); i++) {
-        InstallOperation* op = install.at(i);
+    for (auto op: install) {
         if (!op->install) {
-            QScopedPointer<PackageVersion> pv(op->findPackageVersion(err));
+            std::unique_ptr<PackageVersion> pv(op->findPackageVersion(err));
             if (!err->isEmpty())
                 break;
 
             if (!names.isEmpty())
                 names.append(", ");
-            if (pv.isNull())
+            if (!pv)
                 names.append(op->package + " " +
                         op->version.getVersionString());
             else
@@ -1145,16 +1991,15 @@ bool App::confirm(const QList<InstallOperation*> install, QString* title,
 
     QString installNames;
     if (err->isEmpty()) {
-        for (int i = 0; i < install.count(); i++) {
-            InstallOperation* op = install.at(i);
+        for (auto op: install) {
             if (op->install) {
-                QScopedPointer<PackageVersion> pv(op->findPackageVersion(err));
+                std::unique_ptr<PackageVersion> pv(op->findPackageVersion(err));
                 if (!err->isEmpty())
                     break;
 
                 if (!installNames.isEmpty())
                     installNames.append(", ");
-                if (pv.isNull())
+                if (!pv)
                     installNames.append(op->package + " " +
                             op->version.getVersionString());
                 else
@@ -1164,8 +2009,7 @@ bool App::confirm(const QList<InstallOperation*> install, QString* title,
     }
 
     int installCount = 0, uninstallCount = 0;
-    for (int i = 0; i < install.count(); i++) {
-        InstallOperation* op = install.at(i);
+    for (auto op: install) {
         if (op->install)
             installCount++;
         else
@@ -1184,17 +2028,16 @@ bool App::confirm(const QList<InstallOperation*> install, QString* title,
         *title = "Uninstalling";
         InstallOperation* op0 = install.at(0);
 
-        QScopedPointer<PackageVersion> pv(op0->findPackageVersion(err));
+        std::unique_ptr<PackageVersion> pv(op0->findPackageVersion(err));
         if (err->isEmpty()) {
-            if (pv.isNull())
+            if (!pv)
                 pv.reset(new PackageVersion(op0->package, op0->version));
 
             msg = QString("The package %1 will be uninstalled. "
                     "The corresponding directory %2 "
                     "will be completely deleted. "
                     "There is no way to restore the files. Are you sure (y/n)?:").
-                    arg(pv->toString()).
-                    arg(pv->getPath());
+                    arg(pv->toString(), pv->getPath());
             b = WPMUtils::confirmConsole(msg);
         } else {
             b = false;
@@ -1233,13 +2076,25 @@ bool App::confirm(const QList<InstallOperation*> install, QString* title,
     return b;
 }
 
-QString App::remove()
+void App::remove(Job *job)
 {
-    Job* job = clp.createJob();
     job->setTitle("Removing packages");
 
+    DBRepository* rep = DBRepository::getDefault();
+
     if (job->shouldProceed()) {
-        Job* sub = job->newSubJob(0.01,
+        QString err = rep->openDefault();
+        if (!err.isEmpty())
+            job->setErrorMessage(err);
+    }
+
+    if (job->shouldProceed()) {
+        /* we ignore the returned error as it should also work for non-admins */
+        addNpackdCL(rep);
+    }
+
+    if (job->shouldProceed()) {
+        Job* sub = job->newSubJob(0.1,
                 "Reading list of installed packages from the registry");
         InstalledPackages* ip = InstalledPackages::getDefault();
         QString err = ip->readRegistryDatabase();
@@ -1249,17 +2104,7 @@ QString App::remove()
             sub->completeWithProgress();
     }
 
-    if (job->shouldProceed()) {
-        Job* rjob = job->newSubJob(0.09,
-                "Detecting installed software");
-        InstalledPackages::getDefault()->refresh(DBRepository::getDefault(),
-                rjob);
-        if (!rjob->getErrorMessage().isEmpty()) {
-            job->setErrorMessage(rjob->getErrorMessage());
-        }
-    }
-
-    int programCloseType = WPMUtils::CLOSE_WINDOW;
+    DWORD programCloseType = WPMUtils::CLOSE_WINDOW;
     if (job->shouldProceed()) {
         QString err;
         programCloseType = WPMUtils::getProgramCloseType(cl, &err);
@@ -1269,30 +2114,36 @@ QString App::remove()
     }
 
     QString err;
-    QList<PackageVersion*> toRemove =
-            WPMUtils::getPackageVersionOptions(cl, &err, false);
+    std::vector<PackageVersion*> toRemove =
+            PackageVersion::getRemovePackageVersionOptions(cl, &err);
     if (!err.isEmpty())
         job->setErrorMessage(err);
 
-    AbstractRepository* ar = AbstractRepository::getDefault_();
-    QList<InstallOperation*> ops;
+    std::vector<InstallOperation*> ops;
+    DAG opsDependencies;
+    InstalledPackages installed(*InstalledPackages::getDefault());
+
+    if (job->shouldProceed()) {
+        err = rep->planAddMissingDeps(installed, ops, opsDependencies);
+        if (!err.isEmpty())
+            job->setErrorMessage(err);
+    }
+
     if (job->shouldProceed()) {
         QString err;
-        QList<PackageVersion*> installed = ar->getInstalled_(&err);
         if (!err.isEmpty())
             job->setErrorMessage(err);
 
         if (job->shouldProceed()) {
-            for (int i = 0; i < toRemove.size(); i++) {
-                PackageVersion* pv = toRemove.at(i);
-                err = pv->planUninstallation(installed, ops);
+            for (auto pv: toRemove) {
+                err = rep->planUninstallation(installed,
+                        pv->package, pv->version, ops, opsDependencies);
                 if (!err.isEmpty()) {
                     job->setErrorMessage(err);
                     break;
                 }
             }
         }
-        qDeleteAll(installed);
     }
 
     /**
@@ -1311,35 +2162,35 @@ QString App::remove()
     if (job->shouldProceed()) {
         Job* removeJob = job->newSubJob(0.9,
                 "Removing");
-        processInstallOperations(removeJob, ops, programCloseType);
+        processInstallOperations(removeJob, rep, ops, opsDependencies,
+                programCloseType,
+                interactive, "", "", "", "");
         if (!removeJob->getErrorMessage().isEmpty())
-            job->setErrorMessage(QString("Error removing: %1\n").
+            job->setErrorMessage(QString("Error removing: %1\r\n").
                     arg(removeJob->getErrorMessage()));
     }
 
-    job->complete();
-
-    QString r = job->getErrorMessage();
-    if (job->isCancelled()) {
-        r = "The package removal was cancelled";
-    } else if (r.isEmpty()) {
-        WPMUtils::outputTextConsole("The packages were removed successfully\n");
+    if (job->shouldProceed()) {
+        qCInfo(npackdImportant()).noquote() << "The packages were removed successfully";
     }
-
-    delete job;
 
     qDeleteAll(ops);
     qDeleteAll(toRemove);
 
-    return r;
+    job->complete();
 }
 
-QString App::info()
+void App::info(Job* job)
 {
-    QString r;
+    bool json = cl.isPresent("json");
 
-    Job* job = clp.createJob();
     job->setTitle("Showing information");
+
+    if (job->shouldProceed()) {
+        QString err = DBRepository::getDefault()->openDefault("default", true);
+        if (!err.isEmpty())
+            job->setErrorMessage(err);
+    }
 
     if (job->shouldProceed()) {
         InstalledPackages* ip = InstalledPackages::getDefault();
@@ -1350,164 +2201,200 @@ QString App::info()
             job->setProgress(0.01);
     }
 
-    delete job;
-
     QString package = cl.get("package");
     QString version = cl.get("version");
 
-    if (r.isEmpty()) {
+    if (job->shouldProceed()) {
         if (package.isNull()) {
-            r = "Missing option: --package";
+            job->setErrorMessage("Missing option: --package");
         }
     }
 
-    if (r.isEmpty()) {
+    if (job->shouldProceed()) {
         if (!Package::isValidName(package)) {
-            r = "Invalid package name: " + package;
+            job->setErrorMessage("Invalid package name: " + package);
         }
     }
 
     DBRepository* rep = DBRepository::getDefault();
-    Package* p = 0;
-    if (r.isEmpty()) {
-        p = WPMUtils::findOnePackage(package, &r);
+    Package* p = nullptr;
+    if (job->shouldProceed()) {
+        QString r;
+        p = rep->findOnePackage(package, &r);
+        if (!r.isEmpty())
+            job->setErrorMessage(r);
     }
 
     Version v;
-    if (r.isEmpty()) {
+    if (job->shouldProceed()) {
         // debug: WPMUtils::outputTextConsole <<  package) << " " << versions);
         if (!version.isNull()) {
             if (!v.setVersion(version)) {
-                r = "Cannot parse version: " + version;
+                job->setErrorMessage("Cannot parse version: " + version);
             }
         }
     }
 
-    PackageVersion* pv = 0;
-    if (r.isEmpty()) {
+    PackageVersion* pv = nullptr;
+    if (job->shouldProceed()) {
         if (!version.isNull()) {
+            QString r;
             pv = rep->findPackageVersion_(p->name, v, &r);
-            if (r.isEmpty() && !pv) {
-                r = QString("Package version %1 not found").
-                        arg(v.getVersionString());
+            if (!r.isEmpty())
+                job->setErrorMessage(r);
+            else if (!pv) {
+                job->setErrorMessage(QString("Package version %1 not found").
+                        arg(v.getVersionString()));
             }
         }
     }
 
-    if (r.isEmpty()) {
-        WPMUtils::outputTextConsole("Title: " +
-                p->title + "\n");
-        if (pv)
-            WPMUtils::outputTextConsole("Version: " +
-                    pv->version.getVersionString() + "\n");
-        WPMUtils::outputTextConsole("Description: " + p->description + "\n");
-        WPMUtils::outputTextConsole("License: " + p->license + "\n");
-        if (pv) {
-            WPMUtils::outputTextConsole("Installation path: " +
-                    pv->getPath() + "\n");
+    if (job->shouldProceed()) {
+        if (json) {
+            QJsonObject top;
+            if (pv)
+                pv->toJSON(top);
+            else
+                p->toJSON(top);
+            printJSON(top);
+        } else {
+            WPMUtils::writeln("Title: " +
+                    p->title);
+            if (pv)
+                WPMUtils::writeln("Version: " +
+                        pv->version.getVersionString());
+            WPMUtils::writeln("Description: " + p->description);
+            WPMUtils::writeln("License: " + p->license);
 
-            InstalledPackages* ip = InstalledPackages::getDefault();
-            InstalledPackageVersion* ipv = ip->find(pv->package, pv->version);
-            WPMUtils::outputTextConsole("Detection info: " +
-                    (ipv ? ipv->detectionInfo : "") + "\n");
-            delete ipv;
-        }
-        WPMUtils::outputTextConsole("Internal package name: " +
-                p->name + "\n");
-        if (pv) {
-            WPMUtils::outputTextConsole("Status: " +
-                    pv->getStatus() + "\n");
-            WPMUtils::outputTextConsole("Download URL: " +
-                    pv->download.toString() + "\n");
-        }
-        WPMUtils::outputTextConsole("Package home page: " + p->url + "\n");
-        WPMUtils::outputTextConsole("Change log: " + p->getChangeLog() + "\n");
-        WPMUtils::outputTextConsole("Categories: " +
-                p->categories.join(", ") + "\n");
-        WPMUtils::outputTextConsole("Icon: " + p->getIcon() + "\n");
-        QList<QString> screenshots = p->links.values("screenshot");
-        WPMUtils::outputTextConsole("Screen shots: " +
-                (screenshots.count() > 0 ? screenshots.at(0) : "n/a") +
-                "\n");
-        for (int i = 1; i < screenshots.count(); i++) {
-            WPMUtils::outputTextConsole("    " + screenshots.at(i) + "\n");
-        }
+            if (pv) {
+                WPMUtils::writeln("Installation path: " +
+                        pv->getPath());
 
-        if (pv) {
-            WPMUtils::outputTextConsole(QString("Type: ") +
-                    (pv->type == 0 ? "zip" : "one-file") + "\n");
-
-            WPMUtils::outputTextConsole(QString("Hash sum: ") +
-                    (pv->hashSumType == QCryptographicHash::Sha1 ?
-                    "SHA-1" : "SHA-256") +
-                    ": " + pv->sha1 + "\n");
-
-            QString details;
-            for (int i = 0; i < pv->importantFiles.count(); i++) {
-                if (i != 0)
-                    details.append("; ");
-                details.append(pv->importantFilesTitles.at(i));
-                details.append(" (");
-                details.append(pv->importantFiles.at(i));
-                details.append(")");
+                InstalledPackages* ip = InstalledPackages::getDefault();
+                InstalledPackageVersion* ipv = ip->find(pv->package, pv->version);
+                WPMUtils::writeln("Detection info: " +
+                        (ipv ? ipv->detectionInfo : ""));
+                delete ipv;
             }
-            WPMUtils::outputTextConsole("Important files: " + details + "\n");
-        }
-
-        if (pv) {
-            QString details;
-            for (int i = 0; i < pv->files.count(); i++) {
-                if (i != 0)
-                    details.append("; ");
-                details.append(pv->files.at(i)->path);
+            WPMUtils::writeln("Internal package name: " +
+                    p->name);
+            if (pv) {
+                WPMUtils::writeln("Status: " +
+                        pv->getStatus(rep));
+                WPMUtils::writeln("Download URL: " +
+                        pv->download.toString(QUrl::FullyEncoded));
             }
-            WPMUtils::outputTextConsole("Text files: " + details + "\n");
-        }
-
-        if (!pv) {
-            QString versions;
-            QList<PackageVersion*> pvs = rep->getPackageVersions_(p->name, &r);
-            for (int i = 0; i < pvs.count(); i++) {
-                PackageVersion* opv = pvs.at(i);
-                if (i != 0)
-                    versions.append(", ");
-                versions.append(opv->version.getVersionString());
+            WPMUtils::writeln("Package home page: " + p->url);
+            WPMUtils::writeln("Change log: " + p->getChangeLog());
+            WPMUtils::writeln("Categories: " +
+                    WPMUtils::join(p->categories, ", "));
+            WPMUtils::writeln("Icon: " + p->getIcon());
+            std::vector<QString> screenshots = p->getLinks("screenshot");
+            WPMUtils::writeln("Screen shots: " +
+                    (screenshots.size() > 0 ? screenshots.at(0) : "n/a")
+                    );
+            for (auto&& i: screenshots) {
+                WPMUtils::writeln("    " + i);
             }
-            qDeleteAll(pvs);
-            WPMUtils::outputTextConsole("Versions: " + versions + "\n");
-        }
 
-        if (!pv) {
-            InstalledPackages* ip = InstalledPackages::getDefault();
-            QList<InstalledPackageVersion*> ipvs = ip->getByPackage(p->name);
-            if (ipvs.count() > 0) {
-                WPMUtils::outputTextConsole(QString("%1 versions are installed:\n").
-                        arg(ipvs.count()));
-                for (int i = 0; i < ipvs.count(); ++i) {
-                    InstalledPackageVersion* ipv = ipvs.at(i);
-                    if (!ipv->getDirectory().isEmpty())
-                        WPMUtils::outputTextConsole("    " +
-                                ipv->version.getVersionString() +
-                                " in " + ipv->getDirectory() + "\n");
+            if (pv) {
+                QString type;
+                switch (pv->type) {
+                    case PackageVersion::Type::ONE_FILE:
+                        type = "one-file";
+                        break;
+                    case PackageVersion::Type::INNO_SETUP:
+                        type = "inno-setup";
+                        break;
+                    case PackageVersion::Type::NSIS:
+                        type = "nsis";
+                        break;
+                    default:
+                        type = "zip";
                 }
-            } else {
-                WPMUtils::outputTextConsole("No versions are installed\n");
+
+                WPMUtils::writeln(QString("Type: ") + type);
+
+                WPMUtils::writeln(QString("Hash sum: ") +
+                        (pv->hashSumType == QCryptographicHash::Sha1 ?
+                        "SHA-1" : "SHA-256") +
+                        ": " + pv->sha1);
+
+                QString details;
+                for (int i = 0; i < static_cast<int>(pv->importantFiles.size()); i++) {
+                    if (i != 0)
+                        details.append("; ");
+                    details.append(pv->importantFilesTitles.at(i));
+                    details.append(" (");
+                    details.append(pv->importantFiles.at(i));
+                    details.append(")");
+                }
+                WPMUtils::writeln("Important files: " + details);
             }
-            qDeleteAll(ipvs);
+
+            if (pv) {
+                QString details;
+                for (auto f: pv->files) {
+                    if (!details.isEmpty())
+                        details.append("; ");
+                    details.append(f->path);
+                }
+                WPMUtils::writeln("Text files: " + details);
+            }
+
+            if (!pv) {
+                QString versions, r;
+                std::vector<PackageVersion*> pvs = rep->getPackageVersions_(
+                        p->name, &r);
+                if (r.isEmpty()) {
+                    for (auto opv: pvs) {
+                        if (!versions.isEmpty())
+                            versions.append(", ");
+                        versions.append(opv->version.getVersionString());
+                    }
+                } else {
+                    job->setErrorMessage(r);
+                }
+                qDeleteAll(pvs);
+                WPMUtils::writeln("Versions: " + versions);
+            }
+
+            if (!pv) {
+                InstalledPackages* ip = InstalledPackages::getDefault();
+                std::vector<InstalledPackageVersion*> ipvs = ip->getByPackage(p->name);
+                if (ipvs.size() > 0) {
+                    WPMUtils::writeln(QString("%1 versions are installed:").
+                            arg(ipvs.size()));
+                    for (auto ipv: ipvs) {
+                        if (!ipv->getDirectory().isEmpty())
+                            WPMUtils::writeln("    " +
+                                    ipv->version.getVersionString() +
+                                    " in " + ipv->getDirectory());
+                    }
+                } else {
+                    WPMUtils::writeln("No versions are installed");
+                }
+                qDeleteAll(ipvs);
+            }
         }
-    }
+    }    
 
-
-    if (r.isEmpty()) {
+    if (job->shouldProceed()) {
         if (pv) {
-            WPMUtils::outputTextConsole("Dependency tree:\n");
-            r = printDependencies(pv->installed(), "", 1, pv);
+            if (json) {
+                // nothing
+            } else {
+                WPMUtils::writeln("Dependency tree:");
+                QString r = printDependencies(pv->installed(), "", 1, pv);
+                if (!r.isEmpty())
+                    job->setErrorMessage(r);
+            }
         }
     }
 
     delete pv;
 
-    return r;
+    job->complete();
 }
 
 QString App::printDependencies(bool onlyInstalled, const QString parentPrefix,
@@ -1515,24 +2402,26 @@ QString App::printDependencies(bool onlyInstalled, const QString parentPrefix,
 {
     QString err;
 
-    for (int i = 0; i < pv->dependencies.count(); ++i) {
+    InstalledPackages* ip = InstalledPackages::getDefault();
+    DBRepository* rep = DBRepository::getDefault();
+    for (auto d: pv->dependencies) {
         QString prefix;
-        if (i == pv->dependencies.count() - 1)
-            prefix = (QString() + ((QChar)0x2514) + ((QChar)0x2500));
+        if (d == pv->dependencies.back())
+            prefix = QString() + QChar(0x2514) + QChar(0x2500);
         else
-            prefix = (QString() + ((QChar)0x251c) + ((QChar)0x2500));
+            prefix = QString() + QChar(0x251c) + QChar(0x2500);
 
-        Dependency* d = pv->dependencies.at(i);
-        InstalledPackageVersion* ipv = d->findHighestInstalledMatch();
+        InstalledPackageVersion* ipv = ip->findHighestInstalledMatch(*d);
 
-        PackageVersion* pvd = 0;
+        PackageVersion* pvd = nullptr;
 
         QString s;
         if (ipv) {
-            pvd = AbstractRepository::getDefault_()->
+            pvd = rep->
                     findPackageVersion_(ipv->package, ipv->version, &err);
         } else {
-            pvd = d->findBestMatchToInstall(QList<PackageVersion*>(), &err);
+            pvd = rep->findBestMatchToInstall(*d,
+                    std::vector<PackageVersion*>(), &err);
         }
         delete ipv;
 
@@ -1544,29 +2433,30 @@ QString App::printDependencies(bool onlyInstalled, const QString parentPrefix,
         QChar before;
         if (!pvd) {
             s = QString("Missing dependency on %1").
-                    arg(d->toString(true));
+                    arg(rep->toString(*d, true));
             before = ' ';
         } else {
             s = QString("%1 resolved to %2").
-                    arg(d->toString(true)).
-                    arg(pvd->version.getVersionString());
+                    arg(rep->toString(*d, true),
+                    pvd->version.getVersionString());
             if (!pvd->installed())
                 s += " (not yet installed)";
 
-            if (pvd->dependencies.count() > 0)
-                before = (QChar) 0xb7;
+            if (pvd->dependencies.size() > 0)
+                // middle dot (Unicode)
+                before = QChar(0xb7);
             else
                 before = ' ';
         }
 
-        WPMUtils::outputTextConsole(parentPrefix + prefix + before + s + "\n");
+        WPMUtils::writeln(parentPrefix + prefix + before + s);
 
         if (pvd) {
             QString nestedPrefix;
-            if (i == pv->dependencies.count() - 1)
+            if (d == pv->dependencies.back())
                 nestedPrefix = parentPrefix + "  ";
             else
-                nestedPrefix = parentPrefix + ((QChar)0x2502) + " ";
+                nestedPrefix = parentPrefix + QChar(0x2502) + " ";
             err = printDependencies(onlyInstalled,
                     nestedPrefix,
                     level + 1, pvd);
@@ -1580,10 +2470,20 @@ QString App::printDependencies(bool onlyInstalled, const QString parentPrefix,
     return err;
 }
 
-QString App::detect()
+void App::detect(Job* job)
 {
-    Job* job = clp.createJob();
     job->setTitle("Detecting packages");
+
+    if (job->shouldProceed()) {
+        QString err = DBRepository::getDefault()->openDefault();
+        if (!err.isEmpty())
+            job->setErrorMessage(err);
+    }
+
+    QString user = cl.get("user");
+    QString password = cl.get("password");
+    QString proxyUser = cl.get("proxy-user");
+    QString proxyPassword = cl.get("proxy-password");
 
     if (job->shouldProceed()) {
         Job* sub = job->newSubJob(0.01,
@@ -1596,13 +2496,156 @@ QString App::detect()
             sub->completeWithProgress();
     }
 
-    DBRepository* rep = DBRepository::getDefault();
-    rep->updateF5(job);
-    QString r = job->getErrorMessage();
-    if (job->getErrorMessage().isEmpty()) {
-        WPMUtils::outputTextConsole("Package detection completed successfully\n");
+    std::vector<QUrl*> urls;
+    if (job->shouldProceed()) {
+        QString err;
+        urls = PackageUtils::getRepositoryURLs(&err);
+        if (!err.isEmpty())
+            job->setErrorMessage(QObject::tr("Cannot load the list of repositories: %1").arg(err));
     }
-    delete job;
 
-    return r;
+    DBRepository* rep = DBRepository::getDefault();
+    rep->clearAndDownloadRepositories(job, urls, interactive, user, password, proxyUser, proxyPassword,
+            true);
+    if (job->shouldProceed()) {
+        qCInfo(npackdImportant()).noquote() <<
+                "Package detection completed successfully";
+    }
+
+    qDeleteAll(urls);
+    urls.clear();
+
+    job->complete();
+}
+
+void App::removeSCP(Job *job)
+{
+    job->setTitle("Removing software from the Software Control Panel");
+
+    QString title = cl.get("title");
+
+    if (job->shouldProceed()) {
+        if (title.isNull()) {
+            job->setErrorMessage("Missing option: --title");
+        }
+    }
+
+    Repository rep;
+    std::vector<InstalledPackageVersion*> installed;
+    if (job->shouldProceed()) {
+        ControlPanelThirdPartyPM cppm;
+        cppm.ignoreMSIEntries = false;
+        cppm.cleanPackageTitles = false;
+        Job* scanJob = job->newSubJob(0.1, "Scanning for packages", true, true);
+        cppm.scan(scanJob, &installed, &rep);
+    }
+
+    Package* found = nullptr;
+    if (job->shouldProceed()) {
+        if (title.startsWith('/')) {
+            title = title.mid(1);
+
+            Qt::CaseSensitivity cs = Qt::CaseInsensitive;
+            if (title.endsWith('/')) {
+                title = title.left(title.length() - 1);
+                cs = Qt::CaseSensitive;
+            } else if (title.endsWith("/i")) {
+                title = title.left(title.length() - 2);
+                cs = Qt::CaseInsensitive;
+            } else {
+                job->setErrorMessage("Invalid regular expression: " +
+                        cl.get("title"));
+            }
+
+            if (job->shouldProceed()) {
+                qCDebug(npackd) << "regular expression" << title;
+
+                QRegExp re(title, cs);
+                for (auto p: rep.packages) {
+                    qCDebug(npackd) << p->title;
+                    if (re.indexIn(p->title) >= 0) {
+                        found = p;
+                        break;
+                    }
+                }
+            }
+        } else {
+            for (auto p: rep.packages) {
+                if (p->title == title) {
+                    found = p;
+                    break;
+                }
+            }
+        }
+
+        if (!found)
+            job->setErrorMessage("Cannot find the package");
+    }
+
+    PackageVersion* pv = nullptr;
+    if (job->shouldProceed()) {
+        qCDebug(npackd) << "found package" << found->name;
+
+        for (auto ipv: installed) {
+            qCDebug(npackd) << "installed" << ipv->package <<
+                    ipv->version.getVersionString();
+
+            // ipv->installed() ins not checked here as the installation
+            // directory may be empty (unknown)
+            if (ipv->package == found->name/* && ipv->installed()*/) {
+                QString err;
+                pv = rep.findPackageVersion_(
+                        ipv->package, ipv->version, &err);
+                if (!err.isEmpty()) {
+                    job->setErrorMessage(err);
+                }
+                break;
+            }
+        }
+        if (job->shouldProceed() && !pv)
+            job->setErrorMessage("Cannot find the package version");
+    }
+
+    PackageVersionFile* pvf = nullptr;
+    if (job->shouldProceed()) {
+        for (auto f: pv->files) {
+            if (f->path.compare(".Npackd\\Uninstall.bat",
+                    Qt::CaseInsensitive) == 0) {
+                pvf = f;
+            }
+        }
+        if (job->shouldProceed() && !pvf)
+            job->setErrorMessage("Removal script was not found");
+    }
+
+    if (job->shouldProceed()) {
+        QString cmd = pvf->content;
+        QTemporaryFile of(QDir::tempPath() + "\\nclXXXXXX.bat");
+        if (!of.open())
+            job->setErrorMessage(of.errorString());
+        else {
+            of.setAutoRemove(false);
+            QString path = of.fileName();
+            QDir dir(path);
+            path = dir.dirName();
+            dir.cdUp();
+            QString where = dir.absolutePath();
+
+            QByteArray ba = cmd.toUtf8();
+            if (of.write(ba.data(), ba.length()) == -1)
+                job->setErrorMessage(of.errorString());
+
+            of.close();
+            Job* execJob = job->newSubJob(0.8, "Running the script", true, true);
+
+            where.replace('/', '\\');
+
+            //WPMUtils::writeln(path + " " + where);
+
+            WPMUtils::executeBatchFile(execJob, where,
+                    path, WPMUtils::getMessagesLog(), std::vector<QString>(), true);
+        }
+    }
+
+    job->complete();
 }
