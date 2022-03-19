@@ -1,0 +1,48 @@
+version: 1.27.0.{build}
+image: Visual Studio 2019
+clone_folder: c:\projects\Npackd
+environment:
+  matrix:
+  # Profiling static builds does not work with Very Sleepy
+  - bits: 64
+    prg: npackd
+    static: OFF
+  - bits: 32
+    prg: npackdcl
+    static: ON
+  - bits: 64
+    prg: npackd
+    static: ON
+  - bits: 64
+    prg: npackdcl
+    static: ON
+  - bits: 32
+    prg: npackd
+    static: ON
+  - bits: 32
+    prg: clu
+    static: ON
+  covtoken:
+    secure: yPwsn7ojqxg5m7pxyjIf3LV1GwoHd4m3q5iQrKCDzZ4=
+init:
+- ps: iex ((new-object net.webclient).DownloadString('https://raw.githubusercontent.com/appveyor/ci/master/scripts/enable-http-proxy.ps1'))
+- ps: iex ((new-object net.webclient).DownloadString('https://raw.githubusercontent.com/appveyor/ci/master/scripts/enable-rdp.ps1'))
+install:
+- cmd.exe /C AppVeyorInstall.bat
+build_script:
+- cmd.exe /C AppVeyorBuild.bat
+test_script:
+- cmd.exe /C AppVeyorTest.bat
+deploy:
+  description: 'Automated release'
+  provider: GitHub
+  auth_token:
+    secure: TZRXNYgUHwdfwkAfUimkaegIlCs5+UrAKl484ZCxAgvT5TmqA8TKd9nadxXHXDA0
+  draft: true
+  on:
+    appveyor_repo_tag: true
+after_build:
+- ps: |
+    if ($env:APPVEYOR_REPO_BRANCH -eq 'master') {
+      $env:APPVEYOR_BAKE_IMAGE = 'my-image'
+    }
